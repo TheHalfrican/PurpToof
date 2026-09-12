@@ -109,16 +109,102 @@ normal use and then responds sluggishly to a real fault.
 
 ---
 
+## FINDING: "connected" means three different things
+
+Worth writing down because it causes real confusion: Windows can show the
+phone as connected while the phone shows nothing, and neither is lying.
+
+| Layer | What it reports | Where to read it |
+|---|---|---|
+| Bluetooth link | An ACL link with *some* profile attached - hands-free, AVRCP, phonebook | Windows Settings says "Connected" on this alone |
+| A2DP stream | Whether audio can actually flow | `AudioPlaybackConnection::State()` |
+| Remote's own view | What the phone believes it is doing | GSMTC / AVRCP |
+
+Two traps this sets:
+
+- `AudioPlaybackConnection::State()` reflects **only the connection object we
+  hold**. If we have not opened it, it reads `Closed` regardless of what
+  Settings displays. It is not a system-wide connectedness query.
+- iOS is terse about a PC paired as a *sink* and frequently will not show it
+  as connected even while a profile link exists. Absence of a connection on
+  the phone's Bluetooth screen is not evidence the link is down.
+
+`--debug-sessions` reports all three layers separately and never conflates
+them, which is the whole reason it prints the layer numbers.
+
+## PARTIAL: Signal A - the machinery works, A2DP attribution still unknown
+
+Run on 2026-09-11 with Discord audio playing and the phone idle. Default
+render endpoint was `Headphones (A50 X Game)`.
+
+- **Endpoint meter works.** Peak tracked real audio, 1-second maxima ranging
+  0.02 - 0.86 across the window.
+- **Session-scoped metering and attribution work.** `DiscordPTB.exe` (pid
+  6976) showed `Active` with peak 0.486 while the other eight sessions sat at
+  exactly 0.0. So `IAudioSessionControl2::GetProcessId` -> QI for
+  `IAudioMeterInformation` is a viable path *in general*.
+- **Whether A2DP render audio gets its own session is STILL UNKNOWN.** The
+  phone was not streaming during this run, so there was nothing to attribute.
+  This needs a re-run while the phone actually plays. The `<audio engine /
+  system>` entry at pid 0 is the outcome to watch for: if A2DP audio lands
+  there, Signal A cannot be session-scoped.
+
+### Bug found in our own interop, worth remembering
+
+`IAudioSessionControl2::IsSystemSoundsSession()` returns a **raw HRESULT**,
+not a `Result`: `S_OK` means yes, `S_FALSE` means no. Both are *success*
+codes, so `.is_ok()` is true for every session and labelled all nine as
+system sounds. Correct test is `== S_OK`.
+
+This is exactly the failure mode `platform/` is supposed to be too dumb to
+have, and an argument for keeping HRESULT-returning calls wrapped in one
+named helper each rather than inlined at call sites.
+
+## PARTIAL: Signal B - no session from the phone while idle
+
+Same run. GSMTC returned exactly **one** session, and it was not the phone:
+
+```
+Helium.TL7FSSFXV44M357KD5SIY7AQBE
+    PlaybackStatus: Paused
+    metadata: Onimusha: Way of the Sword - Before You Buy - gameranx
+```
+
+That is a browser on the PC. The iPhone published **no GSMTC session at all**,
+despite `Noah's iPhone Avrcp Transport` existing as a PnP node.
+
+**Do not over-read this.** The phone was idle and our A2DP stream was closed,
+and a GSMTC session may well only materialise once the remote is actually
+playing over a live AVRCP link. The finding is that *the PnP node existing is
+not sufficient* - which invalidates the earlier inference in `soak.md` that
+the node's presence meant Signal B would be available. Still unresolved until
+observed while streaming.
+
+## CORRECTION: the decision table needs more rows than CLAUDE.md assumes
+
+CLAUDE.md's test matrix says
+`{Playing, Paused, Stopped, Unknown, Unavailable}`. The real WinRT enum is:
+
+```
+GlobalSystemMediaTransportControlsSessionPlaybackStatus
+    Closed = 0, Opened = 1, Changing = 2, Stopped = 3, Playing = 4, Paused = 5
+```
+
+Six variants, plus "no session exists at all" as a distinct seventh case
+(which is what Signal-B-unavailable actually looks like, and is not the same
+as `Closed`). `Changing` in particular is a transient the table has to handle
+explicitly, or it will be lumped in with something it is not.
+
+---
+
 ## STILL OPEN
 
-- **Signal A attribution.** Does the internally-rendered A2DP audio appear as
-  a WASAPI session attributable to our PID, or does it land on the audio
-  engine / a system process? Needs `--debug-sessions` while streaming. Falls
-  back to the endpoint-level meter if unattributable.
-- **Signal B availability.** The iPhone exposes an `Avrcp Transport` PnP node,
-  so GSMTC is expected to work on this rig - but "the node exists" is not
-  "a `GlobalSystemMediaTransportControlsSession` shows up with a usable
-  `PlaybackStatus`". Unconfirmed until observed while streaming.
-- **Cause of the unprompted close** (above).
+- **Signal A attribution for A2DP specifically** - see PARTIAL above. Needs
+  `--debug-sessions` while the phone streams.
+- **Signal B availability while streaming** - see PARTIAL above.
+- **Cause of the unprompted `Opened -> Closed`.** Best lead so far: the user
+  reports tapping the PC in the iPhone's Bluetooth menu around that time,
+  which would explain a brief drop. Still not distinguished from an idle
+  teardown.
 - **Radio selective suspend.** The Intel adapter's power-management state has
   not been read yet.

@@ -23,10 +23,13 @@ Reference test rig, recorded because several results are device-specific:
 
 - **Host:** Windows 11 Pro, build 26200 (well above the 19041 floor)
 - **Radio:** Intel(R) Wireless Bluetooth(R)
-- **Phone:** iPhone 15 Pro Max — pairs as `Noah's iPhone`, exposes
-  `A2DP SNK` plus an `Avrcp Transport` node, so Signal B (GSMTC over AVRCP)
-  is expected to be available on this rig. Do not generalise that to other
-  phones; some publish no AVRCP metadata at all and the app must degrade.
+- **Phone:** iPhone 15 Pro Max — pairs as `Noah’s iPhone`, exposes
+  `A2DP SNK` plus an `Avrcp Transport` node. **That does not imply Signal B
+  works**: with the phone idle, GSMTC published no session for it at all
+  (see `docs/verify.md`). The node existing is necessary, not sufficient.
+  Availability while streaming is still unverified. Do not generalise either
+  way to other phones; some publish no AVRCP metadata at all and the app must
+  degrade.
 - **Default render endpoint during development:** Astro A50 X (`A50 X Game`),
   a USB base station with a 2.4 GHz link to the headset — *not* a Bluetooth
   device, so it is not disturbed by radio-toggle tests.

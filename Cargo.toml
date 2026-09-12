@@ -18,8 +18,31 @@ features = [
     "Devices_Enumeration",
     # AudioPlaybackConnection: the only sanctioned A2DP sink on modern Windows.
     "Media_Audio",
-    # CoInitializeEx — WinRT activation needs an initialized apartment.
+    # Signal B. GlobalSystemMediaTransportControlsSessionManager — the remote's
+    # own view of what it is playing, surfaced over AVRCP.
+    "Media_Control",
+    # CoInitializeEx, CoCreateInstance, STGM_READ.
     "Win32_System_Com",
+    # IAudioMeterInformation lives in its own child namespace, not alongside
+    # the rest of the WASAPI interfaces.
+    "Win32_Media_Audio_Endpoints",
+    # Signal A. IMMDeviceEnumerator and the session
+    # interfaces (IAudioSessionManager2 / IAudioSessionControl2) used to work
+    # out whether A2DP render audio is attributable to a process at all.
+    "Win32_Media_Audio",
+    # PROPVARIANT, PropVariantClear — reading the endpoint's friendly name.
+    "Win32_System_Com_StructuredStorage",
+    # VT_LPWSTR, the PROPVARIANT discriminant we expect for a device name.
+    "Win32_System_Variant",
+    # IPropertyStore.
+    "Win32_UI_Shell_PropertiesSystem",
+    # PKEY_Device_FriendlyName.
+    "Win32_Devices_FunctionDiscovery",
+    # OpenProcess / QueryFullProcessImageNameW — naming the process that owns
+    # an audio session, which is the whole point of the attribution check.
+    "Win32_System_Threading",
+    # CloseHandle for the above.
+    "Win32_Foundation",
 ]
 
 # Match Lockstep: keep this crate cheap to debug while dependencies stay
