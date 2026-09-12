@@ -45,8 +45,12 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
+      # --no-tests=pass because nextest treats an empty test set as an error,
+      # and the crate genuinely has no tests until milestone 5. This is not a
+      # licence to ship an untested core: the ratio gate below is what makes
+      # "core/ has no tests" a build failure, and it is the stricter check.
       - name: Test
-        run: cargo nextest run
+        run: cargo nextest run --no-tests=pass
 
       # Enforced on src/core/ only. The exemptions and the reasoning behind
       # them are documented in the script itself — read it before changing
