@@ -49,11 +49,25 @@ If Gitea is unreachable the push fails as a unit and nothing lands; that is the 
 
 ## Packaging — read this before writing code
 
-`AudioPlaybackConnection` requires the `bluetooth` **DeviceCapability**, which requires **package identity**. But a packaged UWP app gets the UWP lifecycle, and app suspension under memory pressure is a prime suspect for the Store app's failure mode.
+Target: **plain Win32 desktop app, UNPACKAGED. No MSIX.**
 
-Target: **Win32 desktop app + sparse MSIX package** — identity for the capability check, but the process is an ordinary desktop process that Windows never suspends.
+**RESOLVED — this section's original premise was wrong.** It assumed
+`AudioPlaybackConnection` needs the `bluetooth` DeviceCapability and therefore
+package identity, which would have forced a sparse MSIX package. It does not.
+The spike (`src/bin/spike-a2dp.rs`) cleared every gate the capability could be
+enforced at — class activation, enumeration, `TryCreateFromId`, `Start()`, and
+`Open()` — from an ordinary `cargo run` exe with no identity of any kind.
+`Open()` returned `Success`; `DeniedBySystem` never appeared. Full evidence in
+`docs/verify.md`.
 
-**VERIFY FIRST, before building anything else:** write a ~50-line spike that calls `AudioPlaybackConnection::GetDeviceSelector()` and `TryCreateFromId()` from an unpackaged Win32 exe. If it works unpackaged, skip MSIX entirely. If it fails, confirm sparse MSIX satisfies the capability check. This decision gates the whole project — do not proceed on assumption.
+This is the good outcome. It means the process is an ordinary desktop process
+that Windows never suspends, so UWP app suspension under memory pressure —
+the prime suspect for the Store app's failure mode — is designed out rather
+than worked around. There is no packaging work in this project.
+
+Re-run `cargo run --bin spike-a2dp` if a future Windows build is suspected of
+tightening this. `--start-only` exercises the radio without opening a stream,
+so the check is safe to run on a machine in use; bare (no flags) is read-only.
 
 ## Connection lifecycle
 
@@ -97,7 +111,27 @@ if remote_playback == Playing
 then -> recover()
 ```
 
-`recover()`: drop the `AudioPlaybackConnection`, release COM interfaces, re-run the lifecycle above. Target under 1s end to end.
+`recover()`: drop the `AudioPlaybackConnection`, release COM interfaces, re-run the lifecycle above. Target under 1s end to end. Call `Close()` explicitly rather than relying on `Drop`, and do not treat `Open() == Success` as "live" — see below.
+
+**Amendment from observed behaviour (`docs/verify.md`), not yet folded into
+the model above:**
+
+1. `Open()` returns `Success` while `State()` still reads `Closed`; the
+   `Opened` transition arrives asynchronously afterwards. So a recovery is
+   only complete once `StateChanged -> Opened` is seen, under a timeout.
+   `Success` followed by no transition is a *failed* recovery.
+2. The link goes `Opened -> Closed` on its own during normal use. A `Closed`
+   transition is therefore **not** a fault, but the app cannot idle in
+   `Closed` either or audio will not resume. This splits the single
+   `recover()` above into two paths:
+
+   - **re-arm** — benign, expected, no backoff, no reconnect-log entry
+   - **recovery** — the watchdog fired, audio is genuinely dead, backoff
+     applies, gets a log entry
+
+   Collapsing them gives either a reconnect log full of noise every time a
+   song ends, or a ladder backed off to 60s during normal use that then
+   responds sluggishly to a real fault.
 
 Backoff on repeated failures: 1s, 2s, 5s, 10s, 30s, cap at 60s. Reset the ladder after 60s of healthy flow. Never busy-loop reconnect attempts — that is worse than the bug being fixed.
 
@@ -224,9 +258,10 @@ Every one ends in `Streaming` with zero manual steps. Record results in `docs/so
 
 ## Order of work
 
-1. Repo on Gitea, GitHub mirror remote, CI skeleton green on an empty crate
-2. Packaging spike (unpackaged vs sparse MSIX) — gates everything
-3. Bare connect + render, no UI, confirm audio flows
+1. ~~Repo on Gitea, GitHub mirror remote, CI skeleton green on an empty crate~~ **DONE**
+2. ~~Packaging spike (unpackaged vs sparse MSIX) — gates everything~~ **DONE — unpackaged wins, no MSIX**
+3. Bare connect + render, no UI, confirm audio flows — *partly done: the spike
+   opens a real stream and reaches `Opened`. Audible confirmation outstanding.*
 4. `--debug-sessions` and resolve both VERIFY items
 5. `core/` traits + `FakeConnection` + health state machine, test-first
 6. `platform/` impls behind those traits, `recover()` wired up
