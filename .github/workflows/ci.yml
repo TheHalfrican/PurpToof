@@ -1,0 +1,56 @@
+name: CI
+
+# The pure core only. Everything that needs a real Bluetooth radio, a paired
+# phone, or a live audio endpoint — the A2DP sink itself, the WASAPI peak
+# meter, GSMTC playback state — is verified on the target machine via the soak
+# matrix in docs/soak.md. A hosted runner has none of that hardware, and
+# mocking the WinRT seam here would only test the mock.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no global `RUSTFLAGS: -D warnings`: RUSTFLAGS applies to
+  # dependencies too, so a warning inside the `windows` crate would fail our
+  # build for no reason. The lint gate is the clippy step below, which only
+  # lints this crate.
+
+jobs:
+  check:
+    # windows-latest is not a preference. This crate binds WinRT and Win32
+    # directly and does not build anywhere else.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # --all-targets so test code is linted to the same standard as the crate.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo nextest run
+
+      # Enforced on src/core/ only. The exemptions and the reasoning behind
+      # them are documented in the script itself — read it before changing
+      # this step.
+      - name: Test-to-production ratio gate (core/ only)
+        shell: pwsh
+        run: ./scripts/check-test-ratio.ps1

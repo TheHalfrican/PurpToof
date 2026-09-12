@@ -1,0 +1,32 @@
+[package]
+name = "purptoof"
+version = "0.1.0"
+edition = "2024"
+description = "Windows Bluetooth A2DP audio receiver that recovers itself when the audio path dies"
+
+[dependencies]
+anyhow = "1.0.104"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    # IAsyncOperation and .get() on WinRT async methods; HSTRING.
+    "Foundation",
+    # IVectorView, needed to walk a DeviceInformationCollection.
+    "Foundation_Collections",
+    # DeviceInformation::FindAllAsync — enumerates paired A2DP sources.
+    "Devices_Enumeration",
+    # AudioPlaybackConnection: the only sanctioned A2DP sink on modern Windows.
+    "Media_Audio",
+    # CoInitializeEx — WinRT activation needs an initialized apartment.
+    "Win32_System_Com",
+]
+
+# Match Lockstep: keep this crate cheap to debug while dependencies stay
+# optimized. The audio watchdog polls at ~10 Hz and a fully unoptimized
+# dependency tree makes timing observations in a debug build meaningless.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
