@@ -6,6 +6,16 @@ description = "Windows Bluetooth A2DP audio receiver that recovers itself when t
 
 [dependencies]
 anyhow = "1.0.104"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+# Two invariants that table-driven tests cannot express: that no input
+# sequence produces a reconnect storm, and that sustained Playing + silence
+# always eventually recovers. The first protects the user from a bug in the
+# decision logic; the second stops the first from being satisfied by a state
+# machine that simply never acts.
+proptest = "1.5"
 
 [dependencies.windows]
 version = "0.62.2"

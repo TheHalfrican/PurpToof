@@ -26,6 +26,16 @@ $MinRatio = 0.9
 $CoreDir = Join-Path $PSScriptRoot '..' 'src' 'core'
 $TestsDir = Join-Path $PSScriptRoot '..' 'tests'
 
+# Files under src/core/ that are test SUPPORT, counted entirely as test code
+# even though their contents are not wrapped in a `#[cfg(test)]` block.
+#
+# fakes.rs holds the test doubles for the four OS-facing traits. Its module
+# declaration in mod.rs is `#[cfg(test)]`, so none of it ships in the binary,
+# but the file body itself carries no marker this script could detect. Counting
+# test doubles as *production* would be doubly wrong: it would inflate the
+# denominator and then demand tests for the test helpers.
+$TestSupportFiles = @('fakes.rs')
+
 function Measure-RustFile {
     param([string]$Path)
 
@@ -93,6 +103,12 @@ $test = 0
 
 foreach ($f in Get-ChildItem -Path $CoreDir -Filter *.rs -Recurse -File) {
     $m = Measure-RustFile -Path $f.FullName
+    if ($TestSupportFiles -contains $f.Name) {
+        $n = $m.Production + $m.Test
+        $test += $n
+        Write-Output ("  {0,-40} prod {1,5}  test {2,5}  (test support)" -f $f.Name, 0, $n)
+        continue
+    }
     $prod += $m.Production
     $test += $m.Test
     Write-Output ("  {0,-40} prod {1,5}  test {2,5}" -f $f.Name, $m.Production, $m.Test)

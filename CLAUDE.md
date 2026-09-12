@@ -262,8 +262,12 @@ Every one ends in `Streaming` with zero manual steps. Record results in `docs/so
 2. ~~Packaging spike (unpackaged vs sparse MSIX) — gates everything~~ **DONE — unpackaged wins, no MSIX**
 3. Bare connect + render, no UI, confirm audio flows — *partly done: the spike
    opens a real stream and reaches `Opened`. Audible confirmation outstanding.*
-4. `--debug-sessions` and resolve both VERIFY items
-5. `core/` traits + `FakeConnection` + health state machine, test-first
+4. ~~`--debug-sessions`~~ **DONE** and resolve both VERIFY items — *the tool
+   ships and reports all four layers; both VERIFY items still need one run
+   while the phone is actually streaming. See `docs/verify.md`.*
+5. ~~`core/` traits + `FakeConnection` + health state machine, test-first~~
+   **DONE** — 57 tests, ratio 2.5:1, `FakeConnection` reproduces the
+   `Opened`-while-silent bug deterministically
 6. `platform/` impls behind those traits, `recover()` wired up
 7. Re-arm triggers
 8. egui UI and tray

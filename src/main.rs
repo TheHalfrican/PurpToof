@@ -7,6 +7,8 @@
 use anyhow::{Context, Result};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
+// The pure logic lives in the library half of this crate (src/lib.rs).
+
 mod debug_sessions;
 
 fn main() -> Result<()> {
