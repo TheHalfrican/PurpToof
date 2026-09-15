@@ -91,6 +91,13 @@ where
         self.monitor.status()
     }
 
+    /// The configuration the state machine is running with. Callers need it to
+    /// present the same thresholds the decisions are made on - a UI that drew
+    /// its own silence line would eventually disagree with the watchdog.
+    pub fn config(&self) -> &Config {
+        self.monitor.config()
+    }
+
     pub fn note_trigger(&mut self, trigger: Trigger) {
         self.monitor.note_trigger(trigger);
     }

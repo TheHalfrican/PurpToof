@@ -44,7 +44,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $dest = "$env:USERPROFILE\.cargo\bin"
+          # Respect CARGO_HOME. The self-hosted runner sets it to a
+          # runner-local directory so CI cannot touch the developer's real
+          # Rust install; hosted runners leave it unset.
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $dest = Join-Path $cargoHome 'bin'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $zip = Join-Path $env:RUNNER_TEMP 'nextest.zip'
           Invoke-WebRequest -Uri 'https://get.nexte.st/latest/windows' -OutFile $zip

@@ -85,15 +85,17 @@ pub fn run(secs: u32) -> Result<()> {
             rearms = snap.rearms;
         }
 
-        for entry in snap.log.iter().skip(logged) {
-            println!("[{at:>6.1}s] RECONNECT: {}", entry.reason);
+        if snap.log_len > logged {
+            for entry in worker.log().into_iter().skip(logged) {
+                println!("[{at:>6.1}s] RECONNECT: {}", entry.reason);
+            }
+            logged = snap.log_len;
         }
-        logged = snap.log.len();
 
         std::thread::sleep(RENDER);
     }
 
-    let events = worker.snapshot().log.len();
+    let events = worker.snapshot().log_len;
     // Dropping the worker sends Shutdown and joins the thread.
     drop(worker);
 

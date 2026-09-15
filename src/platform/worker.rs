@@ -24,11 +24,12 @@
 //!   `IMMNotificationClient` regardless: its callbacks must not block or
 //!   re-enter the enumerator.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -67,16 +68,35 @@ pub struct LogEntry {
     pub reason: String,
 }
 
+/// How many peak samples to retain, at the 10 Hz tick rate.
+///
+/// 15 seconds. Long enough to see that audio stopped a moment ago rather than
+/// only that it is silent now - which matters more here than in most meters,
+/// because the app provably cannot tell a pause from a dead path and the user
+/// is the one making that call.
+pub const PEAK_HISTORY: usize = 150;
+
 /// The latest view of the world, for the UI to render.
 ///
 /// A mutex over the newest value rather than a queue: the UI redraws far
 /// faster than the supervisor ticks and only ever wants the current state, so
 /// a channel would just build a backlog of stale frames.
+///
+/// Deliberately does **not** carry the reconnect log. Cloning up to
+/// [`LOG_CAPACITY`] owned strings on every frame is pure waste when the log
+/// changes a handful of times a day; callers watch [`Snapshot::log_len`] and
+/// call [`Worker::log`] only when it moves.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub status: HealthStatus,
     pub peak: f32,
     pub scope: MeterScope,
+    /// Newest last, at the 10 Hz tick rate, capped at [`PEAK_HISTORY`].
+    pub peak_history: VecDeque<f32>,
+    /// How long the meter has read below `silence_eps`, or `None` if audio is
+    /// moving right now. Measured from the sample where it went quiet, not
+    /// from process start.
+    pub silent_for: Option<Duration>,
     pub device_name: String,
     /// How many of the three event-driven triggers registered. Surfaced because
     /// a missing one silently degrades recovery, and "it stopped waking up
@@ -94,7 +114,9 @@ pub struct Snapshot {
     /// to tell a trigger that fired from one that never registered.
     pub rearms: u64,
     pub last_rearm: Option<String>,
-    pub log: Vec<LogEntry>,
+    /// Number of entries in the reconnect log. Watch this rather than cloning
+    /// the log itself; fetch with [`Worker::log`] when it changes.
+    pub log_len: usize,
 }
 
 impl Default for Snapshot {
@@ -103,12 +125,14 @@ impl Default for Snapshot {
             status: HealthStatus::Disconnected,
             peak: 0.0,
             scope: MeterScope::Endpoint,
+            peak_history: VecDeque::new(),
+            silent_for: None,
             device_name: String::new(),
             triggers_registered: 0,
             device_watch_active: false,
             rearms: 0,
             last_rearm: None,
-            log: Vec::new(),
+            log_len: 0,
         }
     }
 }
@@ -117,6 +141,7 @@ impl Default for Snapshot {
 pub struct Worker {
     commands: Sender<Command>,
     shared: Arc<Mutex<Snapshot>>,
+    log: Arc<Mutex<Vec<LogEntry>>>,
     running: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -129,11 +154,13 @@ impl Worker {
     /// nobody is watching.
     pub fn spawn(config: Config) -> Result<Self> {
         let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let running = Arc::new(AtomicBool::new(true));
         let (commands, rx) = channel();
         let (ready_tx, ready_rx) = channel();
 
         let thread_shared = Arc::clone(&shared);
+        let thread_log = Arc::clone(&log);
         let thread_running = Arc::clone(&running);
 
         let trigger_tx = commands.clone();
@@ -145,6 +172,7 @@ impl Worker {
                     rx,
                     trigger_tx,
                     thread_shared,
+                    thread_log,
                     thread_running,
                     ready_tx,
                 );
@@ -156,6 +184,7 @@ impl Worker {
             Ok(Ok(())) => Ok(Self {
                 commands,
                 shared,
+                log,
                 running,
                 join: Some(join),
             }),
@@ -176,6 +205,15 @@ impl Worker {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// The reconnect log. Clones owned strings, so call it only when
+    /// [`Snapshot::log_len`] has changed rather than every frame.
+    pub fn log(&self) -> Vec<LogEntry> {
+        self.log
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
     }
 
     /// Post a trigger. Never blocks; a dead worker is not an error worth
@@ -205,6 +243,7 @@ fn worker_main(
     commands: Receiver<Command>,
     trigger_tx: Sender<Command>,
     shared: Arc<Mutex<Snapshot>>,
+    log: Arc<Mutex<Vec<LogEntry>>>,
     running: Arc<AtomicBool>,
     ready: Sender<std::result::Result<(), String>>,
 ) {
@@ -257,6 +296,9 @@ fn worker_main(
 
     let _ = ready.send(Ok(()));
 
+    let silence_eps = sup.config().silence_eps;
+    let mut silent_since: Option<Instant> = Some(Instant::now());
+
     while let ControlFlow::Continue = drain_commands(&commands, &mut sup) {
         // Polled rather than event-driven; see DefaultDeviceWatch. Checked
         // before the tick so a change is acted on this pass rather than next.
@@ -269,14 +311,33 @@ fn worker_main(
         let tick = sup.tick();
         let reading = sup.meter().read();
 
+        // Tracked here rather than in the UI so the history is sampled at the
+        // honest 10 Hz tick rate. A UI that built it at frame rate would
+        // stretch each real sample across several pixels and imply detail the
+        // meter never had.
+        if reading.peak >= silence_eps {
+            silent_since = None;
+        } else if silent_since.is_none() {
+            silent_since = Some(Instant::now());
+        }
+
         if let Ok(mut s) = shared.lock() {
             s.status = sup.status();
             s.peak = reading.peak;
             s.scope = reading.scope;
+            s.silent_for = silent_since.map(|t| t.elapsed());
+
+            s.peak_history.push_back(reading.peak);
+            while s.peak_history.len() > PEAK_HISTORY {
+                s.peak_history.pop_front();
+            }
 
             if let Tick::Dispatched(action) = tick {
                 if action.is_loggable() {
-                    push_log(&mut s, action);
+                    if let Ok(mut l) = log.lock() {
+                        push_log(&mut l, action);
+                        s.log_len = l.len();
+                    }
                 } else {
                     s.rearms += 1;
                     s.last_rearm = Some(format!("{action:?}"));
@@ -321,15 +382,15 @@ where
     }
 }
 
-fn push_log(snapshot: &mut Snapshot, action: Action) {
-    snapshot.log.push(LogEntry {
+fn push_log(log: &mut Vec<LogEntry>, action: Action) {
+    log.push(LogEntry {
         at: SystemTime::now(),
         reason: format!("{action:?}"),
     });
     // Bounded, oldest first out.
-    let overflow = snapshot.log.len().saturating_sub(LOG_CAPACITY);
+    let overflow = log.len().saturating_sub(LOG_CAPACITY);
     if overflow > 0 {
-        snapshot.log.drain(0..overflow);
+        log.drain(0..overflow);
     }
 }
 
@@ -340,19 +401,19 @@ mod tests {
 
     #[test]
     fn the_log_is_bounded() {
-        let mut s = Snapshot::default();
+        let mut s: Vec<LogEntry> = Vec::new();
         for _ in 0..(LOG_CAPACITY * 2) {
             push_log(
                 &mut s,
                 Action::Recover(RecoveryReason::ReArmExhausted { attempts: 1 }),
             );
         }
-        assert_eq!(s.log.len(), LOG_CAPACITY, "an overnight run must not leak");
+        assert_eq!(s.len(), LOG_CAPACITY, "an overnight run must not leak");
     }
 
     #[test]
     fn the_log_keeps_the_newest_entries() {
-        let mut s = Snapshot::default();
+        let mut s: Vec<LogEntry> = Vec::new();
         for i in 0..(LOG_CAPACITY + 10) {
             push_log(
                 &mut s,
@@ -362,13 +423,12 @@ mod tests {
         // "It healed itself twice in the last hour" is the question the log
         // answers, so dropping the newest would defeat the point.
         assert!(
-            s.log
-                .last()
+            s.last()
                 .unwrap()
                 .reason
                 .contains(&format!("{}", LOG_CAPACITY + 9)),
             "kept the wrong end: {:?}",
-            s.log.last()
+            s.last()
         );
     }
 
