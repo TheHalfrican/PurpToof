@@ -51,6 +51,13 @@ pub struct PurpToofApp {
     tray: Result<Tray, String>,
     close_to_tray: bool,
     visible: bool,
+    /// Set when the user chose Quit from the tray.
+    ///
+    /// Without it, close-to-tray cancels our own shutdown: Quit asks the
+    /// viewport to close, the next pass sees `close_requested` and cannot tell
+    /// that request apart from the user pressing X, so it cancels and hides.
+    /// Quit then silently does nothing.
+    quitting: bool,
     config: Config,
     paths: Paths,
     /// Surfaced next to the settings when a save fails - a silently ignored
@@ -85,6 +92,7 @@ impl PurpToofApp {
             eps,
             tray,
             close_to_tray,
+            quitting: false,
             visible: !start_hidden,
             start_hidden,
         }
@@ -113,7 +121,10 @@ impl PurpToofApp {
 
         if let Ok(tray) = &self.tray {
             match tray.poll() {
-                Some(TrayAction::Quit) => return false,
+                Some(TrayAction::Quit) => {
+                    self.quitting = true;
+                    return false;
+                }
                 Some(TrayAction::Show) => self.show(ctx),
                 Some(TrayAction::Toggle) => {
                     if self.visible {
@@ -136,7 +147,7 @@ impl PurpToofApp {
         // would stop the thing recovering the audio path, which is the entire
         // point of the app.
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.close_to_tray {
+            if self.close_to_tray && !self.quitting {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide(ctx);
             } else {
@@ -149,22 +160,27 @@ impl PurpToofApp {
 }
 
 impl eframe::App for PurpToofApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // The supervisor ticks on its own thread, so nothing here drives it -
-        // this only asks egui to come back and read the next snapshot. It is
-        // also what keeps the tray responsive while the window is hidden: with
-        // no repaint scheduled, menu clicks would sit unread until something
-        // else woke the loop.
-        ui.ctx().request_repaint_after(REPAINT);
+    /// Tray and window handling, every pass.
+    ///
+    /// This MUST live here rather than in `ui`. eframe runs no egui pass at all
+    /// while the window is hidden, so `ui` is never called then - and putting
+    /// the tray polling there meant that the moment you closed to tray, the
+    /// entire tray menu went dead: Quit, Show and Reconnect all stopped
+    /// responding, which is precisely when a tray app needs them most.
+    ///
+    /// The repaint request is what keeps this being called at all while
+    /// hidden.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(REPAINT);
 
-        let ctx = ui.ctx().clone();
-        if !self.handle_window_and_tray(&ctx) {
+        if !self.handle_window_and_tray(ctx) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
         }
+    }
 
-        // Hidden: the supervisor is still running, there is just nothing to
-        // draw. Skipping the body avoids laying out a window nobody sees.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Belt and braces: eframe should not call this while hidden, but
+        // laying out a window nobody can see would be wasted work.
         if !self.visible {
             return;
         }
