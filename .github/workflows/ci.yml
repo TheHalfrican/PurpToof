@@ -96,7 +96,12 @@ jobs:
         shell: pwsh
         run: ./scripts/package.ps1 -SkipBuild
 
+      # GitHub only. Gitea Actions does not implement the v4 artifact API, so
+      # this is the one step that cannot pass on the mirror - and it is the one
+      # step that does not need to. Gitea still builds both installers, which
+      # is what proves packaging works; GitHub is where the artifacts belong.
       - uses: actions/upload-artifact@v4
+        if: ${{ github.server_url == 'https://github.com' }}
         with:
           name: installers
           path: |
