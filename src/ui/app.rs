@@ -299,15 +299,35 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
         DIM
     };
 
+    // The level shown by the bar: a short average, not the instantaneous peak.
+    //
+    // GetPeakValue reports transient peaks, and on real music those hit full
+    // scale constantly - the phone was measured at 1.0002, above nominal. A
+    // bar driven by that is pinned at maximum whenever anything loud plays and
+    // conveys nothing. Averaging one second of samples leaves it well below
+    // full scale and actually moving.
+    //
+    // The history strip below keeps the raw per-sample peaks, so the detail is
+    // not lost, only moved to where it reads better.
+    let level = average_level(&snap.peak_history, snap.peak);
+
     // --- current level ------------------------------------------------------
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, BG_METER);
 
-    // Square-root scaling: peaks live in the low end of 0..1 and a linear bar
-    // spends most of its width empty.
-    let filled = snap.peak.clamp(0.0, 1.0).sqrt();
+    // Linear, deliberately.
+    //
+    // This was square-rooted, on the theory that peaks live in the low end of
+    // 0..1 and a linear bar would sit mostly empty. In practice the observed
+    // range on real music is about 0.2 to 0.75, and sqrt maps that to 0.47 to
+    // 0.85 - a narrow band pinned against the right edge, so the meter reads
+    // as permanently maxed and stops distinguishing loud from very loud.
+    //
+    // Linear spends the full width on the range the audio actually occupies,
+    // and leaves visible headroom above it.
+    let filled = level.clamp(0.0, 1.0);
     if filled > 0.0 {
         let mut bar = rect;
         bar.set_width(rect.width() * filled);
@@ -316,7 +336,7 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
     painter.text(
         rect.right_center() - egui::vec2(6.0, 0.0),
         egui::Align2::RIGHT_CENTER,
-        format!("{:.4}", snap.peak),
+        format!("{level:.4}"),
         egui::FontId::monospace(11.0),
         Color32::from_rgb(200, 200, 205),
     );
@@ -328,7 +348,10 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
 
     // The silence threshold, drawn so the user can see what the watchdog sees
     // rather than guessing where "silent" begins.
-    let eps_y = rect.bottom() - rect.height() * eps.sqrt().max(0.01);
+    // Clamped to a visible minimum: at the default eps of 0.0005 a linear
+    // position would put this line half a pixel off the floor, where it reads
+    // as part of the border rather than as a threshold.
+    let eps_y = rect.bottom() - rect.height() * eps.max(0.012);
     painter.line_segment(
         [
             egui::pos2(rect.left(), eps_y),
@@ -339,7 +362,9 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
 
     let slot = rect.width() / PEAK_HISTORY as f32;
     for (i, sample) in snap.peak_history.iter().enumerate() {
-        let h = sample.clamp(0.0, 1.0).sqrt() * rect.height();
+        // Linear, to match the bar above. Two different curves on the same
+        // screen would disagree about how loud the same moment was.
+        let h = sample.clamp(0.0, 1.0) * rect.height();
         if h <= 0.0 {
             continue;
         }
@@ -373,6 +398,19 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
             },
         );
     });
+}
+
+/// Mean of the last second of peak samples, at the 10 Hz tick rate.
+///
+/// Falls back to the instantaneous value before any history exists, so the
+/// meter is not blank for the first tick after launch.
+fn average_level(history: &std::collections::VecDeque<f32>, fallback: f32) -> f32 {
+    const WINDOW: usize = 10;
+    if history.is_empty() {
+        return fallback;
+    }
+    let n = history.len().min(WINDOW);
+    history.iter().rev().take(n).sum::<f32>() / n as f32
 }
 
 fn status_line(ui: &mut egui::Ui, snap: &Snapshot) {
@@ -480,5 +518,46 @@ fn footnotes(ui: &mut egui::Ui, snap: &Snapshot) {
             .size(10.0)
             .color(AMBER),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::average_level;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn an_empty_history_falls_back_to_the_instant_value() {
+        // Otherwise the meter is blank for the first tick after launch.
+        assert_eq!(average_level(&VecDeque::new(), 0.42), 0.42);
+    }
+
+    #[test]
+    fn transient_peaks_do_not_peg_the_bar() {
+        // The actual complaint: music that touches full scale on transients
+        // pinned the bar at maximum. One full-scale sample among nine quiet
+        // ones must not.
+        let mut h: VecDeque<f32> = VecDeque::from(vec![0.2; 9]);
+        h.push_back(1.0);
+        let level = average_level(&h, 0.0);
+        assert!(level < 0.35, "one transient still dominated: {level}");
+    }
+
+    #[test]
+    fn sustained_loudness_still_reads_loud() {
+        // The averaging must not flatten everything - genuinely loud audio
+        // should still fill most of the bar.
+        let h: VecDeque<f32> = VecDeque::from(vec![0.9; 10]);
+        assert!(average_level(&h, 0.0) > 0.85);
+    }
+
+    #[test]
+    fn only_the_last_second_counts() {
+        // Older samples must age out, or the bar lags far behind the audio.
+        let mut h: VecDeque<f32> = VecDeque::from(vec![1.0; 100]);
+        for _ in 0..10 {
+            h.push_back(0.0);
+        }
+        assert_eq!(average_level(&h, 0.0), 0.0, "stale samples still counted");
     }
 }
