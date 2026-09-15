@@ -5,8 +5,8 @@ state. If they disagree, this file is newer.
 
 **Last updated:** 2026-09-14
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
-**Tests:** 85 passing, ~0.2s, all on a fake clock
-**Ratio gate:** 2.44:1 on `src/core/` against a 0.9 floor
+**Tests:** 96 passing, ~0.2s, all on a fake clock
+**Ratio gate:** 2.55:1 on `src/core/` against a 0.9 floor
 
 ---
 
@@ -104,29 +104,27 @@ raw tables are in `docs/verify.md`; these are the conclusions that change code.
    holding the sink had closed it. `platform/` must read state from the
    connection it owns.
 
-### Step 1 — milestone 7, re-arm triggers
+### Step 1 — milestone 7, the four re-arm triggers
 
-Milestone 6 is done. `core/supervisor.rs` holds the tick loop, generic over the
-four traits so it runs entirely on the fake clock in tests; `platform/` supplies
-the real implementations; `--run` drives it headless. The trigger plumbing only
-has to call `Supervisor::note_trigger`, which already debounces a burst into a
-single re-arm.
+The groundwork is done. `platform/worker.rs` runs the supervisor on its own
+**MTA** thread behind a channel boundary, so all four triggers can be
+callback-based with **no message pump** - an earlier note here claimed
+otherwise and was wrong. Each callback should do nothing but post
+`Command::Trigger`; `IMMNotificationClient` in particular must not block or
+re-enter the enumerator.
 
 | Trigger | Mechanism |
 |---|---|
-| Resume from sleep | `RegisterSuspendResumeNotification`, `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` |
+| Resume from sleep | `RegisterSuspendResumeNotification` with `DEVICE_NOTIFY_CALLBACK` |
 | Bluetooth radio toggled | `Windows.Devices.Radios.Radio::StateChanged` |
 | Default render device changed | `IMMNotificationClient::OnDefaultDeviceChanged` |
 | Device appears / disappears | `DeviceWatcher` over the playback-connection selector |
 
-Two of these need a message pump, which the MTA console process does not have.
-That is the real work here, and it interacts with milestone 8 - egui brings its
-own event loop, so decide where the pump lives before writing either.
+`Trigger::DefaultDeviceChanged` already rebinds the meter via
+`AudioMeter::rebind`; the trigger plumbing only has to deliver it.
 
-**The default-device case also needs more than a trigger.** `WasapiMeter` binds
-to the endpoint at construction and does not follow a later default change, so
-the meter has to be rebuilt, not just the connection. Same for the session
-manager it hunts the A2DP session through.
+Note the device still enumerates with the phone's radio **off**, so
+`DeviceChanged` will not fire merely because the phone was switched off.
 
 ### Step 2 — milestone 8 onward
 
@@ -195,7 +193,7 @@ Beyond CLAUDE.md's sketch, in ways that matter:
 ## Commands
 
 ```bash
-cargo test                                  # 85 tests, ~0.2s
+cargo test                                  # 96 tests, ~0.2s
 cargo clippy --all-targets -- -D warnings   # what CI gates on
 cargo fmt --check
 pwsh -File scripts/check-test-ratio.ps1     # the 0.9:1 gate on core/

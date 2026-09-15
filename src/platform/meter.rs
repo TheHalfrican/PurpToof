@@ -212,4 +212,21 @@ impl AudioMeter for WasapiMeter {
     fn peak(&self) -> f32 {
         self.read().peak
     }
+
+    /// Re-resolve the default render endpoint and drop every cached handle.
+    ///
+    /// `ever_attributed` is cleared too: the new endpoint is a different
+    /// machine as far as attribution is concerned, and carrying the flag over
+    /// would make the meter report `SessionGone` - silence - on an endpoint
+    /// where it has simply not looked yet.
+    ///
+    /// A failure leaves the previous binding in place. A stale meter is worse
+    /// than a fresh one but far better than none, and the trigger will fire
+    /// again if the device situation is still changing.
+    fn rebind(&mut self) {
+        match unsafe { Self::new() } {
+            Ok(fresh) => *self = fresh,
+            Err(e) => tracing::warn!(error = %e, "meter rebind failed, keeping the old binding"),
+        }
+    }
 }

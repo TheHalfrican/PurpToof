@@ -21,7 +21,9 @@ pub mod a2dp_session;
 pub mod meter;
 pub mod remote;
 pub mod sink;
+pub mod worker;
 
 pub use meter::{MeterReading, MeterScope, WasapiMeter};
 pub use remote::GsmtcRemote;
 pub use sink::{Sink, SinkDevice, list_devices};
+pub use worker::{Command, LogEntry, Snapshot, Worker};

@@ -18,6 +18,19 @@ use crate::core::types::{LinkState, PlaybackStatus};
 pub trait AudioMeter {
     /// Peak amplitude since the last read, 0.0 ..= 1.0.
     fn peak(&self) -> f32;
+
+    /// Re-bind to the current default render endpoint.
+    ///
+    /// The meter binds its endpoint and session manager once, at construction,
+    /// and does **not** follow a later default-device change. Reopening the
+    /// connection is not enough: the sink's render target follows the reopen,
+    /// but the meter would keep reading the old endpoint and report silence
+    /// forever while audio played perfectly out of the new one.
+    ///
+    /// So `Trigger::DefaultDeviceChanged` has to rebind the meter as well as
+    /// re-arm the link. Implementations that have nothing to rebind may leave
+    /// the default no-op.
+    fn rebind(&mut self) {}
 }
 
 /// Signal B - does the remote think it is playing.

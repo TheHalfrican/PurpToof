@@ -33,7 +33,9 @@ use std::time::Instant;
 use crate::core::config::Config;
 use crate::core::health::HealthMonitor;
 use crate::core::traits::{AudioMeter, Clock, RemotePlayback, SinkConnection, SinkError};
-use crate::core::types::{Action, HealthStatus, LinkState, Observation, RecoveryOutcome, Trigger};
+use crate::core::types::{
+    Action, HealthStatus, LinkState, Observation, ReArmReason, RecoveryOutcome, Trigger,
+};
 
 /// What one [`Supervisor::tick`] did. Returned for logging and tests; the
 /// caller is not required to branch on it.
@@ -131,7 +133,7 @@ where
         match self.monitor.observe(obs) {
             Action::None => Tick::Idle,
             action => {
-                self.dispatch();
+                self.dispatch(action);
                 Tick::Dispatched(action)
             }
         }
@@ -151,7 +153,18 @@ where
     /// on `Drop`, per CLAUDE.md - reopening without closing is how a stale
     /// half-open connection survives a recovery that was supposed to replace
     /// it.
-    fn dispatch(&mut self) {
+    fn dispatch(&mut self, action: Action) {
+        // The render target follows a reopen; the METER does not. It binds its
+        // endpoint once at construction, so after a default-device change a
+        // re-armed link would play fine while the meter read the old endpoint
+        // and reported silence forever.
+        if matches!(
+            action,
+            Action::ReArm(ReArmReason::Trigger(Trigger::DefaultDeviceChanged))
+        ) {
+            self.meter.rebind();
+        }
+
         self.sink.close();
         match self.sink.open() {
             Ok(()) => self.awaiting_open = Some(self.clock.now()),
@@ -358,6 +371,58 @@ mod tests {
             }
         }
         assert!(escalated, "a real failure must eventually reach the ladder");
+    }
+
+    #[test]
+    fn a_default_device_change_rebinds_the_meter() {
+        // The bug this guards: WasapiMeter binds its endpoint at construction
+        // and does not follow a default change. Re-arming the link alone would
+        // leave the meter reading the old endpoint - silent forever, while
+        // audio plays perfectly out of the new one.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::already_open(),
+            FakeMeter::with_peak(0.4),
+            FakeRemote::playing(),
+        );
+
+        clock.advance_secs(1);
+        assert_eq!(s.tick(), Tick::Idle);
+        assert_eq!(s.meter().rebinds(), 0, "nothing happened yet");
+
+        s.note_trigger(Trigger::DefaultDeviceChanged);
+        clock.advance_secs(2);
+        assert!(matches!(s.tick(), Tick::Dispatched(Action::ReArm(_))));
+        assert_eq!(s.meter().rebinds(), 1);
+    }
+
+    #[test]
+    fn other_triggers_leave_the_meter_alone() {
+        // Rebinding drops every cached handle and the attribution flag, so
+        // doing it on every trigger would throw away a resolved A2DP session
+        // for no reason - and resume fires in bursts.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::already_open(),
+            FakeMeter::with_peak(0.4),
+            FakeRemote::playing(),
+        );
+
+        for trigger in [
+            Trigger::Resume,
+            Trigger::RadioToggled,
+            Trigger::DeviceChanged,
+            Trigger::Manual,
+        ] {
+            s.note_trigger(trigger);
+            clock.advance_secs(2);
+            s.tick();
+            clock.advance_secs(2);
+            s.tick();
+        }
+        assert_eq!(s.meter().rebinds(), 0);
     }
 
     #[test]

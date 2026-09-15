@@ -68,6 +68,11 @@ impl Clock for &FakeClock {
 /// A peak meter under test control.
 pub struct FakeMeter {
     peak: Cell<f32>,
+    /// How many times `rebind` was called. The default-device trigger has to
+    /// rebind the meter as well as re-arm the link, and nothing else observes
+    /// that it happened - a meter left bound to the old endpoint reports
+    /// silence forever while audio plays fine out of the new one.
+    rebinds: Cell<u32>,
 }
 
 impl FakeMeter {
@@ -75,13 +80,19 @@ impl FakeMeter {
     pub fn silent() -> Self {
         Self {
             peak: Cell::new(0.0),
+            rebinds: Cell::new(0),
         }
     }
 
     pub fn with_peak(peak: f32) -> Self {
         Self {
             peak: Cell::new(peak),
+            rebinds: Cell::new(0),
         }
+    }
+
+    pub fn rebinds(&self) -> u32 {
+        self.rebinds.get()
     }
 
     pub fn set(&self, peak: f32) {
@@ -101,6 +112,10 @@ impl FakeMeter {
 impl AudioMeter for FakeMeter {
     fn peak(&self) -> f32 {
         self.peak.get()
+    }
+
+    fn rebind(&mut self) {
+        self.rebinds.set(self.rebinds.get() + 1);
     }
 }
 
