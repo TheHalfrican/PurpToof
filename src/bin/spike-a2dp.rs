@@ -74,6 +74,107 @@ fn parse_hold(args: impl Iterator<Item = String>) -> Option<u32> {
     }
 }
 
+/// Never reopen faster than this. `Open()` can return immediately when no
+/// remote is reachable, and a bare loop around it would spin the radio.
+const REARM_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long to wait for `StateChanged -> Opened` after `Open()` says `Success`.
+/// `Success` is not the transition - see docs/verify.md - so a success with no
+/// transition inside this window is a failed arm, not a live link.
+const OPEN_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hold the sink permanently armed: keep an `Open()` in flight, and the
+/// instant the link closes, open again.
+///
+/// Every line is timestamped from the start of the run so the log can be read
+/// against what the operator was doing on the phone. The question it answers is
+/// narrow: after a link closes, does an `Open()` that nobody prompted complete
+/// on its own when audio starts on the phone?
+fn rearm_loop(connection: &AudioPlaybackConnection, total_secs: u32) -> Result<()> {
+    let run_start = std::time::Instant::now();
+    let deadline = run_start + std::time::Duration::from_secs(total_secs as u64);
+    let stamp = |t: &std::time::Instant| format!("t+{:>5.1}s", t.elapsed().as_secs_f32());
+
+    println!("\n== always-armed sink, {total_secs}s ==");
+    println!(
+        "Start() is held for the whole run, so the PC never stops advertising.\n\
+         Open() is reissued the moment the link closes.\n"
+    );
+
+    let mut arm = 0u32;
+    while std::time::Instant::now() < deadline {
+        arm += 1;
+        let attempt_at = std::time::Instant::now();
+        println!("[{}] arm #{arm}: Open() ...", stamp(&run_start));
+
+        let result = connection.Open().context("Open dispatch failed")?;
+        let status = result.Status()?;
+        let waited = attempt_at.elapsed();
+
+        if status != AudioPlaybackConnectionOpenResultStatus::Success {
+            println!(
+                "[{}] arm #{arm}: {} after {:.1}s - rearming",
+                stamp(&run_start),
+                open_status_name(status),
+                waited.as_secs_f32()
+            );
+            std::thread::sleep(REARM_FLOOR);
+            continue;
+        }
+
+        println!(
+            "[{}] arm #{arm}: Success after {:.1}s - waiting for Opened",
+            stamp(&run_start),
+            waited.as_secs_f32()
+        );
+
+        // `Success` is a dispatch result, not a transition. Wait for the real
+        // thing before calling the link live.
+        let transition_start = std::time::Instant::now();
+        let mut went_open = false;
+        while transition_start.elapsed() < OPEN_TRANSITION_TIMEOUT {
+            if connection.State()? == AudioPlaybackConnectionState::Opened {
+                went_open = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        if !went_open {
+            println!(
+                "[{}] arm #{arm}: Success but NO Opened transition in {:?} - failed arm",
+                stamp(&run_start),
+                OPEN_TRANSITION_TIMEOUT
+            );
+            std::thread::sleep(REARM_FLOOR);
+            continue;
+        }
+
+        println!(
+            "[{}] arm #{arm}: LINK UP after {:.1}s",
+            stamp(&run_start),
+            transition_start.elapsed().as_secs_f32()
+        );
+
+        // Sit on the live link until it drops or the run ends.
+        let up_since = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            if connection.State()? != AudioPlaybackConnectionState::Opened {
+                println!(
+                    "[{}] arm #{arm}: LINK DOWN after {:.1}s up - rearming immediately",
+                    stamp(&run_start),
+                    up_since.elapsed().as_secs_f32()
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    println!("\n[{}] run complete, {arm} arm(s)", stamp(&run_start));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // WinRT activation needs an initialized apartment. MTA is correct for a
     // console process with no message pump.
@@ -96,6 +197,14 @@ fn main() -> Result<()> {
     // running `--debug-sessions` against a live stream from another terminal,
     // which needs room for enumeration plus its own sampling window.
     let hold_secs = parse_hold(std::env::args()).unwrap_or(DEFAULT_HOLD_SECS);
+
+    // `--rearm` is the always-armed sink: Start once, then keep an Open in
+    // flight forever, reopening the instant the link closes. It exists to
+    // answer whether iOS re-routes to the PC by itself once a link has
+    // dropped - which decides whether "audio always resumes" is achievable
+    // from this side alone, or needs a tap in Control Center. It is also a
+    // miniature of the milestone-6 re-arm path.
+    let rearm = std::env::args().any(|a| a == "--rearm");
 
     println!("== stage 1: enumeration + construction (read-only) ==");
 
@@ -152,7 +261,7 @@ fn main() -> Result<()> {
     println!("  device id round-trip: {}", connection.DeviceId()?);
     println!("  initial state: {}", state_name(connection.State()?));
 
-    if !open && !start_only {
+    if !open && !start_only && !rearm {
         // Drop without ever advertising. Nothing on the air learned that this
         // PC is willing to be a speaker.
         drop(connection);
@@ -208,6 +317,14 @@ fn main() -> Result<()> {
              --open (which does route phone audio to the default output)."
         );
         return Ok(());
+    }
+
+    if rearm {
+        let r = rearm_loop(&connection, hold_secs);
+        connection.Close().ok();
+        connection.RemoveStateChanged(token).ok();
+        println!("closed");
+        return r;
     }
 
     println!(

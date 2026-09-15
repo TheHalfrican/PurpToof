@@ -396,6 +396,95 @@ paused-but-loaded versus fully finished. Plausible, one observation each way,
 The app's handling is unchanged either way: `Closed` is benign, re-arm handles
 it, and re-arm skips the backoff ladder.
 
+## RESOLVED: an always-armed sink survives the whole app lifecycle
+
+The question: the app should keep audio playing no matter which app on the
+phone is the source and no matter how the user switches between them. Is that
+achievable from the PC side alone, or does iOS drop the route and require a tap
+in Control Center?
+
+Answer: **achievable, and it needs no recovery at all in this scenario** - the
+link simply does not drop.
+
+Method: `spike-a2dp --rearm --hold=300` holds `Start()` for the whole run and
+keeps an `Open()` in flight, reopening the instant the link closes. Alongside
+it, `purptoof --watch=300`. The operator played music, stopped it, **swiped the
+music app away entirely**, sat on the home screen for ~97s, then opened a
+different app (Twitter) and played a video - **without touching Control Center
+at any point.**
+
+Sink log, in full:
+
+```
+[t+  0.0s] arm #1: Open() ...
+[t+  0.8s] arm #1: Success after 0.8s - waiting for Opened
+  [event] StateChanged -> Opened
+[t+  0.9s] arm #1: LINK UP after 0.1s
+[t+300.0s] run complete, 1 arm(s)
+```
+
+Audio, from the watch log:
+
+| window | operator action | link | session | audio |
+|---|---|---|---|---|
+| t=1-64 | music playing | `Opened` | `Active` | yes, ~0.45 |
+| t=65-161 | stopped, app swiped away, home screen | `Opened` | `Active` | silent |
+| t=162-296 | Twitter video, no Control Center tap | `Opened` | `Active` | yes, ~0.26 |
+| t=297-300 | our sink closed at the deadline | - | `Inactive` | silent |
+
+**One arm. Zero link drops across 300 seconds**, spanning an app switch, an app
+*termination*, 97 seconds of continuous silence, and a change of source app.
+The audio came out of the PC, confirmed by ear, with no user action.
+
+### What this settles
+
+- **The route survives the app lifecycle.** iOS keeps the A2DP route bound to
+  the PC as long as something on this side holds the sink open. A new app's
+  audio follows the existing route automatically.
+- **"Any source app" needs no work.** A2DP is a device-level route, not
+  per-app.
+- **The always-armed design is the whole feature.** Hold `Start()` for process
+  lifetime, keep an `Open()` outstanding, reopen immediately on close. The
+  Store app's intermittency is most likely explained by treating `Closed` as a
+  resting state and waiting for the user.
+
+### Corrects the attempt-1 teardown, again
+
+Attempt 1 this session had the link close ~10s after audio stopped. Here, 97s
+of silence held it. The difference is how the route was established:
+
+- Attempt 1: **Settings > Bluetooth**, tapping the PC in the device list.
+- This run: **Control Center's output picker.**
+
+Same phone, same PC, opposite behaviour. The Bluetooth-menu entry is most
+likely a connection toggle that establishes a weaker binding, or disconnected
+it outright. Not worth chasing further, but it means **test protocols must
+route via Control Center**, and the UI should tell users to do the same.
+
+### Design consequence: "armed and waiting" is not a failure
+
+`Open()` completed in 0.8s here because the phone was already routed. With the
+phone absent or out of range it will return `RequestTimedOut` repeatedly, and
+the re-arm loop will keep reissuing - correctly, forever.
+
+`HealthMonitor` currently escalates after `rearm_escalation_threshold`
+consecutive re-arms that do not produce flow
+(`RecoveryReason::ReArmExhausted`). For an always-armed sink that is wrong: a
+phone in another room is not a fault, but it would ratchet the ladder to the
+60s cap and then respond sluggishly when the phone comes back.
+
+**`platform/` and `core/` need a distinct `Armed`/`Listening` state** - waiting
+for a remote that has not arrived - separate from re-arming that keeps failing
+with a remote present. Only the latter may touch the backoff ladder. This is
+the one change milestone 6 must make to the state machine rather than just
+implementing behind it.
+
+### Still untested
+
+The link held across the app lifecycle. It has **not** been tested across the
+four re-arm triggers - sleep/resume, radio toggle, default render device
+change, device removal. Those remain the reason the re-arm path exists.
+
 ## Tooling changes made during this run
 
 - **`--watch[=SECS]`** added: one line per second of link state, endpoint peak,
@@ -410,6 +499,10 @@ it, and re-arm skips the backoff ladder.
   maxima. Attribution was only readable after this change.
 - **`spike-a2dp --hold=SECS`** added, so a run can be held open long enough to
   drive the phone through a sequence.
+- **`spike-a2dp --rearm`** added: the always-armed sink. `Start()` held for the
+  whole run, an `Open()` always in flight, reopened the instant the link
+  closes, every transition timestamped. It answered the app-lifecycle question
+  above and is a miniature of the milestone-6 re-arm path.
 
 ---
 

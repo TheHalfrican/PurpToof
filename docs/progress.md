@@ -78,7 +78,28 @@ raw tables are in `docs/verify.md`; these are the conclusions that change code.
    produces it is unverified — so treat it as a trigger worth acting on, never
    as the only thing the watchdog watches.
 
-5. **Do not read link state from a second connection object.** A probe
+5. **An always-armed sink survives the entire phone app lifecycle.** A 300s
+   run held the link `Opened` through an app switch, the source app being
+   *swiped away*, 97s of silence, and a different app starting playback - one
+   arm, zero drops, audio auto-routed to the PC with no user action. So the
+   headline feature is just: hold `Start()` for process lifetime, keep an
+   `Open()` outstanding, reopen immediately on close. Never idle in `Closed`.
+
+   Corollary: route via **Control Center**, not Settings > Bluetooth. The
+   Bluetooth-menu path produced a link that dropped after ~10s of silence; the
+   Control Center path held for 97s+. Say so in the UI.
+
+6. **"Armed and waiting" must not escalate.** `HealthMonitor` currently
+   escalates after `rearm_escalation_threshold` consecutive re-arms without
+   flow (`RecoveryReason::ReArmExhausted`). With a permanently armed sink,
+   `Open()` returns `RequestTimedOut` forever while the phone is out of
+   range - which is normal, not a fault, and would otherwise ratchet the ladder
+   to its 60s cap and respond sluggishly when the phone returns. Add a distinct
+   `Armed`/`Listening` state; only re-arms that fail *with a remote present*
+   may touch the ladder. **This is a `core/` change, not just a `platform/`
+   one.**
+
+7. **Do not read link state from a second connection object.** A probe
    `AudioPlaybackConnection` kept reporting `Opened` after the process actually
    holding the sink had closed it. `platform/` must read state from the
    connection it owns.
@@ -187,6 +208,7 @@ cargo run --bin purptoof -- --watch=120         # read-only, one line per second
 cargo run --bin spike-a2dp                     # read-only: enumerate + construct
 cargo run --bin spike-a2dp -- --start-only     # exercises the radio, moves no audio
 cargo run --bin spike-a2dp -- --open --hold=N  # OPENS A STREAM — routes phone audio
+cargo run --bin spike-a2dp -- --rearm --hold=N # always-armed sink; also opens a stream
 ```
 
 `cargo nextest run --no-tests=pass` is what CI runs; nextest is not installed
