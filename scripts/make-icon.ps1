@@ -31,6 +31,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+. (Join-Path $PSScriptRoot 'round-corners.ps1')
 
 $root = Split-Path -Parent $PSScriptRoot
 $src = Join-Path $root 'assets\icon-source.jpg'
@@ -101,6 +102,10 @@ $gi.Clear([System.Drawing.Color]::Black)
 $gi.DrawImage($square, 0, 0, $IconSize, $IconSize)
 $gi.Dispose(); $square.Dispose()
 
+# Rounded corners. Must happen before the RGBA is extracted, and the corners
+# become transparent rather than black - see scripts/round-corners.ps1.
+Set-RoundedCorners -Bitmap $icon
+
 $bytes = New-Object byte[] ($IconSize * $IconSize * 4)
 $i = 0
 for ($y = 0; $y -lt $IconSize; $y++) {
@@ -109,12 +114,12 @@ for ($y = 0; $y -lt $IconSize; $y++) {
         # Resampling reintroduces near-black halos around the glow; clamp again
         # so the background is exactly #000000 in the shipped blob.
         $peak = [Math]::Max($c.R, [Math]::Max($c.G, $c.B))
-        if ($peak -le 8) {
+        if ($peak -le 8 -and $c.A -eq 255) {
             $bytes[$i] = 0; $bytes[$i + 1] = 0; $bytes[$i + 2] = 0
         } else {
             $bytes[$i] = $c.R; $bytes[$i + 1] = $c.G; $bytes[$i + 2] = $c.B
         }
-        $bytes[$i + 3] = 255
+        $bytes[$i + 3] = $c.A
         $i += 4
     }
 }
@@ -151,6 +156,7 @@ foreach ($sz in $sizes) {
     $srcIcon = [System.Drawing.Image]::FromFile($outPreview)
     $gg.DrawImage($srcIcon, 0, 0, $sz, $sz)
     $srcIcon.Dispose(); $gg.Dispose()
+    Set-RoundedCorners -Bitmap $b
     $ms = New-Object System.IO.MemoryStream
     $b.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $b.Dispose()

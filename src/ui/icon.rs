@@ -21,7 +21,7 @@ use eframe::egui::IconData;
 /// Edge length of the embedded image. Must match `scripts/make-icon.ps1`.
 const SIZE: u32 = 256;
 
-/// Tightly packed RGBA, row-major, fully opaque.
+/// Tightly packed RGBA, row-major. Opaque except the rounded corners.
 const PIXELS: &[u8] = include_bytes!("../../assets/icon.rgba");
 
 pub fn icon_data() -> IconData {
@@ -50,25 +50,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn it_is_fully_opaque() {
-        // A transparent background would let the taskbar show through the
-        // fang. The art is composited on black, not cut out.
-        assert!(PIXELS.chunks(4).all(|p| p[3] == 255));
+    fn px(x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * SIZE + x) * 4) as usize;
+        (PIXELS[i], PIXELS[i + 1], PIXELS[i + 2], PIXELS[i + 3])
     }
 
     #[test]
-    fn the_background_is_true_black() {
-        // The explicit requirement. The source JPEG's background is 0-2 with
-        // noise plus an ambient glow; anything above zero shows as a lighter
-        // square around the icon on a dark title bar.
-        let corner = |x: u32, y: u32| {
-            let i = ((y * SIZE + x) * 4) as usize;
-            (PIXELS[i], PIXELS[i + 1], PIXELS[i + 2])
-        };
+    fn the_corners_are_transparent() {
+        // Rounded corners only read as rounded if what is behind the icon
+        // shows through. Drawing black corners would leave it looking exactly
+        // as square as before.
         for (x, y) in [(0, 0), (SIZE - 1, 0), (0, SIZE - 1), (SIZE - 1, SIZE - 1)] {
-            assert_eq!(corner(x, y), (0, 0, 0), "corner ({x},{y}) is not black");
+            assert_eq!(px(x, y).3, 0, "corner ({x},{y}) is not transparent");
         }
+    }
+
+    #[test]
+    fn the_body_is_opaque_and_the_background_is_true_black() {
+        // Everything inside the rounded rectangle keeps the original contract:
+        // fully opaque, on a background of exactly #000000. The source JPEG's
+        // "black" is 0-2 with noise plus an ambient glow, and anything above
+        // zero shows as a lighter tile on a dark title bar.
+        let mid = SIZE / 2;
+        assert_eq!(px(mid, mid).3, 255, "the middle must be opaque");
+
+        // A point on the straight part of the top edge - past the corner
+        // radius, so unaffected by the mask, and above the artwork.
+        let edge = px(mid, 1);
+        assert_eq!(edge.3, 255, "the straight edge must stay opaque");
+        assert_eq!(
+            (edge.0, edge.1, edge.2),
+            (0, 0, 0),
+            "background is not true black"
+        );
+    }
+
+    #[test]
+    fn the_rounding_is_visible_but_restrained() {
+        // Guards both ways: a mask that did nothing, and one that ate the
+        // artwork. Counts transparent pixels, which for an 18% radius on a
+        // square should be a few percent of the image.
+        let clear = PIXELS.chunks(4).filter(|p| p[3] == 0).count();
+        let total = (SIZE * SIZE) as usize;
+        let percent = clear * 100 / total;
+        assert!(percent >= 1, "no rounding applied ({percent}%)");
+        assert!(percent <= 10, "corners are eating the icon ({percent}%)");
     }
 
     #[test]
