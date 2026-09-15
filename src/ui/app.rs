@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 
-use crate::core::{Config, HealthStatus, Trigger};
+use crate::core::{Config, HealthStatus, Paths, Trigger};
+use crate::platform::autostart;
 use crate::platform::meter::MeterScope;
 use crate::platform::worker::{LogEntry, PEAK_HISTORY};
 use crate::platform::{Snapshot, Worker};
@@ -50,6 +51,11 @@ pub struct PurpToofApp {
     tray: Result<Tray, String>,
     close_to_tray: bool,
     visible: bool,
+    config: Config,
+    paths: Paths,
+    /// Surfaced next to the settings when a save fails - a silently ignored
+    /// checkbox is worse than one that says why it did not stick.
+    settings_error: Option<String>,
     /// Whether the initial hide has been applied. eframe has no viewport to
     /// command until the first frame, so start-minimized cannot be honoured
     /// in `new`.
@@ -57,7 +63,7 @@ pub struct PurpToofApp {
 }
 
 impl PurpToofApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config: Config, paths: Paths) -> Self {
         cc.egui_ctx.set_visuals(visuals());
         let eps = config.silence_eps;
         let tray = Tray::new();
@@ -67,8 +73,12 @@ impl PurpToofApp {
         // Never trap the window behind a tray that does not exist.
         let close_to_tray = config.close_to_tray && tray.is_ok();
         let start_hidden = config.start_minimized && tray.is_ok();
+        let settings = config.clone();
         let worker = Worker::spawn(config).map_err(|e| format!("{e:#}"));
         Self {
+            config: settings,
+            paths,
+            settings_error: None,
             worker,
             log: Vec::new(),
             log_len: 0,
@@ -159,23 +169,27 @@ impl eframe::App for PurpToofApp {
             return;
         }
 
-        let worker = match &self.worker {
-            Ok(w) => w,
-            Err(e) => {
-                let message = e.clone();
-                egui::Frame::central_panel(ui.style()).show(ui, |ui| startup_error(ui, &message));
-                return;
-            }
+        if let Err(e) = &self.worker {
+            let message = e.clone();
+            egui::CentralPanel::default().show(ui, |ui| startup_error(ui, &message));
+            return;
+        }
+
+        // Take the snapshot and refresh the log BEFORE the closure. Holding a
+        // borrow of `self.worker` across it would conflict with the settings
+        // panel, which needs `&mut self`.
+        let Some(snap) = self.worker.as_ref().map(|w| w.snapshot()).ok() else {
+            return;
         };
-
-        let snap = worker.snapshot();
-
-        // Only clone the log when it has actually changed; it carries owned
-        // strings and this runs at 10 Hz.
         if snap.log_len != self.log_len {
-            self.log = worker.log();
+            if let Ok(w) = &self.worker {
+                self.log = w.log();
+            }
             self.log_len = snap.log_len;
         }
+
+        // Collected rather than acted on inline, for the same reason.
+        let mut reconnect = false;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
@@ -191,15 +205,15 @@ impl eframe::App for PurpToofApp {
                     egui::Button::new(RichText::new("Reconnect").size(14.0)),
                 )
                 .on_hover_text(
-                    "Tears the connection down and rebuilds it. Safe at any time - \
-                     and the intended fix when audio has died but the link still \
-                     claims to be open.",
+                    "Tears the connection down and rebuilds it. Safe at any time -                      and the intended fix when audio has died but the link still                      claims to be open.",
                 )
                 .clicked()
             {
-                worker.trigger(Trigger::Manual);
+                reconnect = true;
             }
 
+            ui.separator();
+            settings(ui, self);
             ui.separator();
 
             // Footnotes first, laid out bottom-up, so the log can then expand
@@ -212,6 +226,10 @@ impl eframe::App for PurpToofApp {
                 });
             });
         });
+
+        if reconnect && let Ok(w) = &self.worker {
+            w.trigger(Trigger::Manual);
+        }
     }
 }
 
@@ -411,6 +429,107 @@ fn average_level(history: &std::collections::VecDeque<f32>, fallback: f32) -> f3
     }
     let n = history.len().min(WINDOW);
     history.iter().rev().take(n).sum::<f32>() / n as f32
+}
+
+/// The settings panel. Collapsed by default - the meter is what people open
+/// the window for, and settings are changed once and then forgotten.
+fn settings(ui: &mut egui::Ui, app: &mut PurpToofApp) {
+    egui::CollapsingHeader::new(RichText::new("Settings").size(12.0).color(DIM))
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut changed = false;
+
+            // Autostart writes to the registry as well as the config, and the
+            // registry is the thing that actually has the effect - so it is
+            // applied first and the config only records what was asked for.
+            let mut autostart_on = app.config.autostart;
+            if ui
+                .checkbox(&mut autostart_on, "Start with Windows")
+                .on_hover_text(
+                    "Adds a per-user Run entry. No administrator prompt, and it                      starts only for your account.",
+                )
+                .changed()
+            {
+                match autostart::set(autostart_on) {
+                    Ok(()) => {
+                        app.config.autostart = autostart_on;
+                        changed = true;
+                    }
+                    Err(e) => app.settings_error = Some(e),
+                }
+            }
+
+            if ui
+                .checkbox(&mut app.config.start_minimized, "Start hidden in the tray")
+                .changed()
+            {
+                changed = true;
+            }
+
+            let tray_ok = app.tray.is_ok();
+            ui.add_enabled_ui(tray_ok, |ui| {
+                if ui
+                    .checkbox(&mut app.config.close_to_tray, "Close button hides to tray")
+                    .on_hover_text(if tray_ok {
+                        "Off means the close button exits PurpToof and stops it                          watching the audio path."
+                    } else {
+                        "Unavailable: the notification area could not be reached,                          so there would be no way to get the window back."
+                    })
+                    .changed()
+                {
+                    app.close_to_tray = app.config.close_to_tray;
+                    changed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                let mut secs = app.config.silence_timeout_ms as f32 / 1000.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut secs, 1.0..=30.0)
+                            .suffix(" s")
+                            .text(RichText::new("Silence before recovery").size(11.0)),
+                    )
+                    .on_hover_text(
+                        "How long the remote may claim to be playing while the meter                          reads silence before PurpToof rebuilds the connection.",
+                    )
+                    .changed()
+                {
+                    app.config.silence_timeout_ms = (secs * 1000.0) as u64;
+                    changed = true;
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("Settings: {}", app.paths.config.display()))
+                    .size(9.0)
+                    .color(DIM),
+            );
+            ui.label(
+                RichText::new(format!("Logs: {}", app.paths.log_dir.display()))
+                    .size(9.0)
+                    .color(DIM),
+            );
+
+            if let Some(e) = &app.settings_error {
+                ui.label(RichText::new(e).size(10.0).color(AMBER));
+            }
+
+            if changed {
+                // Written immediately rather than on exit: a tray app is often
+                // killed rather than closed, and settings that quietly did not
+                // persist are worse than settings that cannot be changed.
+                match app.config.save(&app.paths.config) {
+                    Ok(()) => app.settings_error = None,
+                    Err(e) => app.settings_error = Some(e),
+                }
+                // Timeouts are read by the supervisor at construction, so a
+                // change to them needs a restart to take effect. Say so rather
+                // than let it look broken.
+                tracing::info!("settings saved");
+            }
+        });
 }
 
 fn status_line(ui: &mut egui::Ui, snap: &Snapshot) {

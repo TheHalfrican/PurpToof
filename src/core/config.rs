@@ -9,6 +9,7 @@
 //!   typo, must not leave the app unable to start - it is a background audio
 //!   utility, and refusing to run is a worse outcome than ignoring a line.
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,53 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Read the config, falling back to defaults.
+    ///
+    /// Returns the config plus a description of anything that went wrong, so
+    /// the caller can surface it. A malformed file must NOT stop the app: the
+    /// whole point is to keep audio alive, and refusing to start because of a
+    /// stray character in a settings file would be the opposite of that.
+    /// Unknown keys are already ignored by serde, so this only trips on real
+    /// syntax or type errors.
+    pub fn load(path: &Path) -> (Self, Option<String>) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // Absent is the normal first-run case, not a problem worth
+            // reporting.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::default(), None);
+            }
+            Err(e) => {
+                return (
+                    Self::default(),
+                    Some(format!("could not read {}: {e}", path.display())),
+                );
+            }
+        };
+
+        match toml::from_str(&text) {
+            Ok(c) => (c, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!(
+                    "{} is malformed, using defaults: {e}",
+                    path.display()
+                )),
+            ),
+        }
+    }
+
+    /// Write the config back.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +346,66 @@ mod tests {
             c.degraded_silence_timeout() > c.silence_timeout(),
             "degraded timeout must be more patient, not less"
         );
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("purptoof-cfg-{name}-{}.toml", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn a_missing_file_is_not_an_error() {
+        // First run. Reporting this would train the user to ignore warnings.
+        let (c, err) = Config::load(&temp("absent"));
+        assert_eq!(c, Config::default());
+        assert!(err.is_none(), "absent config should be silent: {err:?}");
+    }
+
+    #[test]
+    fn a_malformed_file_falls_back_and_says_so() {
+        // The app must still come up - refusing to start over a settings typo
+        // is the opposite of keeping the audio alive.
+        let p = temp("malformed");
+        std::fs::write(&p, "this is not = = toml").unwrap();
+        let (c, err) = Config::load(&p);
+        assert_eq!(c, Config::default());
+        assert!(err.is_some(), "a broken file must be reported");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn it_round_trips_through_a_real_file() {
+        let p = temp("roundtrip");
+        let original = Config {
+            silence_timeout_ms: 4_321,
+            close_to_tray: false,
+            ..Default::default()
+        };
+        original.save(&p).expect("must save");
+
+        let (back, err) = Config::load(&p);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(back, original);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_partial_file_keeps_defaults_for_everything_else() {
+        // Hand-edited configs are normal; someone setting one key must not
+        // silently zero the rest.
+        let p = temp("partial");
+        std::fs::write(&p, "silence_timeout_ms = 9999\n").unwrap();
+        let (c, err) = Config::load(&p);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(c.silence_timeout_ms, 9_999);
+        assert_eq!(c.silence_eps, Config::default().silence_eps);
+        assert_eq!(c.close_to_tray, Config::default().close_to_tray);
+        let _ = std::fs::remove_file(&p);
     }
 }

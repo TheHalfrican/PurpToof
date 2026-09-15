@@ -19,10 +19,16 @@ eframe = { version = "0.36.2", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-# The facade only, for now. It is a no-op without a subscriber, so platform/
-# can record link transitions before the rolling-file setup arrives at
-# milestone 9 rather than growing print statements that later need removing.
 tracing = "0.1"
+# The subscriber and the rolling daily file. A tray app has nowhere to print,
+# so without this every diagnostic the app already emits goes nowhere - and
+# "did it heal itself overnight" is a question only a log can answer.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
+tracing-appender = "0.2"
 tray-icon = "0.25.0"
 
 [dev-dependencies]
@@ -75,6 +81,8 @@ features = [
     # Re-arm trigger: Radio::StateChanged, for the Bluetooth adapter being
     # toggled from Action Center.
     "Devices_Radios",
+    # Autostart: the per-user Run key.
+    "Win32_System_Registry",
     # RegisterSuspendResumeNotification and DEVICE_NOTIFY_CALLBACK live behind
     # this gate even in their window-free form.
     "Win32_UI_WindowsAndMessaging",

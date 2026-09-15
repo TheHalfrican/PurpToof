@@ -22,8 +22,8 @@ use purptoof::platform::meter::MeterScope;
 /// this is only the reader.
 const RENDER: Duration = Duration::from_millis(100);
 
-pub fn run(secs: u32) -> Result<()> {
-    let worker = Worker::spawn(Config::default())?;
+pub fn run(secs: u32, config: Config) -> Result<()> {
+    let worker = Worker::spawn(config)?;
 
     let first = worker.snapshot();
     println!("PurpToof --run, {secs}s");

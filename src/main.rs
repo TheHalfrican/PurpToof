@@ -5,12 +5,13 @@
 //! which COM apartment. Everything else lives in the library.
 
 use anyhow::{Context, Result};
-use purptoof::core::Config;
+use purptoof::core::{Config, Paths};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
 // The pure logic lives in the library half of this crate (src/lib.rs).
 
 mod debug_sessions;
+mod logging;
 mod run;
 
 fn main() -> Result<()> {
@@ -46,7 +47,8 @@ fn main() -> Result<()> {
     // output, so it is opt-in and bounded. No COM on this thread - `Worker`
     // builds its own apartment on the supervisor thread.
     if let Some(secs) = run_secs(std::env::args()) {
-        return run::run(secs);
+        let (config, _paths, _guard) = startup();
+        return run::run(secs, config);
     }
 
     if std::env::args().any(|a| a == "--help" || a == "-h") {
@@ -56,6 +58,46 @@ fn main() -> Result<()> {
 
     // No flags: the actual app.
     gui()
+}
+
+/// Read settings and start logging.
+///
+/// Both are best effort and report rather than fail. A settings typo or a
+/// read-only log directory must not stop an app whose entire job is to keep
+/// audio alive.
+fn startup() -> (Config, Paths, Option<logging::LogGuard>) {
+    let paths = Paths::resolve();
+    paths.ensure_dirs();
+
+    let (guard, log_note) = logging::init(&paths.log_dir);
+    let (config, config_err) = Config::load(&paths.config);
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        mode = ?paths.mode,
+        config = %paths.config.display(),
+        "PurpToof starting"
+    );
+    if let Some(note) = log_note {
+        tracing::info!(log = %note, "logging to file");
+    }
+    if let Some(e) = config_err {
+        tracing::warn!(error = %e, "config problem");
+    } else if !paths.config.exists() {
+        // Write the defaults on first run. Otherwise the settings file is
+        // invisible until someone changes a setting in the UI, and anyone who
+        // wants to hand-edit it has to know the key names from the source.
+        match config.save(&paths.config) {
+            Ok(()) => tracing::info!(path = %paths.config.display(), "wrote default config"),
+            Err(e) => tracing::warn!(error = %e, "could not write the default config"),
+        }
+    }
+
+    // Keep the Run key in step with the setting, in case the exe moved since
+    // it was last enabled - a stale absolute path starts nothing, silently.
+    purptoof::platform::autostart::reconcile(config.autostart);
+
+    (config, paths, guard)
 }
 
 /// Join the multithreaded apartment on *this* thread.
@@ -75,6 +117,8 @@ fn init_mta() -> Result<()> {
 /// objects are apartment-bound to that thread and must never be touched from
 /// this one.
 fn gui() -> Result<()> {
+    let (config, paths, _log_guard) = startup();
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([420.0, 560.0])
@@ -87,12 +131,7 @@ fn gui() -> Result<()> {
     eframe::run_native(
         "PurpToof",
         options,
-        Box::new(|cc| {
-            Ok(Box::new(purptoof::ui::PurpToofApp::new(
-                cc,
-                Config::default(),
-            )))
-        }),
+        Box::new(move |cc| Ok(Box::new(purptoof::ui::PurpToofApp::new(cc, config, paths)))),
     )
     .map_err(|e| anyhow::anyhow!("could not start the window: {e}"))
 }

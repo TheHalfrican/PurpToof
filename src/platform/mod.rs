@@ -18,6 +18,7 @@
 //! are tested because they can be tested honestly.
 
 pub mod a2dp_session;
+pub mod autostart;
 pub mod meter;
 pub mod remote;
 pub mod sink;
