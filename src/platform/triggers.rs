@@ -204,8 +204,26 @@ unsafe fn register_power(tx: Sender<Command>) -> Result<PowerReg> {
 }
 
 // --- bluetooth radio toggled -------------------------------------------------
+//
+// OBSERVED 2026-09-14: this did NOT fire when Bluetooth was toggled off and on
+// from Action Center, despite registering successfully. The likely reason is
+// that the `Radio` object is invalidated when the adapter is disabled, so the
+// handler is attached to an object that no longer exists by the time the radio
+// returns; re-enumerating would be needed to survive it.
+//
+// It is kept because it is cheap, may behave differently on other adapters,
+// and can fire for state changes that do not drop the link. It is NOT relied
+// on: the same run showed a radio toggle handled completely by the
+// `LinkClosed` re-arm path, which recovered 0.6s after the radio came back.
+// See docs/verify.md.
 
 fn register_radios(tx: Sender<Command>) -> Result<Vec<(Radio, i64)>> {
+    // Documented prerequisite for the Radio APIs. Reading state may work
+    // without it, but asking costs one call and removes a variable.
+    if let Ok(op) = Radio::RequestAccessAsync() {
+        let _ = op.join();
+    }
+
     let radios = Radio::GetRadiosAsync()
         .context("GetRadiosAsync dispatch failed")?
         .join()

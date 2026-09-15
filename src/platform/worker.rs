@@ -82,6 +82,18 @@ pub struct Snapshot {
     /// a missing one silently degrades recovery, and "it stopped waking up
     /// after sleep" is otherwise very hard to diagnose.
     pub triggers_registered: usize,
+    /// Whether the polled default-device watch is running. Same reasoning: it
+    /// can fail to construct, and a silent failure looks exactly like a device
+    /// change that never happens.
+    pub device_watch_active: bool,
+    /// Benign re-arms dispatched so far, with the most recent reason.
+    ///
+    /// Deliberately NOT in `log` - the reconnect log is for genuine recoveries
+    /// and filling it with an entry every time a song ends tells the user
+    /// nothing. But a re-arm leaves no other trace, which made it impossible
+    /// to tell a trigger that fired from one that never registered.
+    pub rearms: u64,
+    pub last_rearm: Option<String>,
     pub log: Vec<LogEntry>,
 }
 
@@ -93,6 +105,9 @@ impl Default for Snapshot {
             scope: MeterScope::Endpoint,
             device_name: String::new(),
             triggers_registered: 0,
+            device_watch_active: false,
+            rearms: 0,
+            last_rearm: None,
             log: Vec::new(),
         }
     }
@@ -237,6 +252,7 @@ fn worker_main(
     };
     if let Ok(mut s) = shared.lock() {
         s.triggers_registered = triggers.registered();
+        s.device_watch_active = device_watch.is_some();
     }
 
     let _ = ready.send(Ok(()));
@@ -258,10 +274,13 @@ fn worker_main(
             s.peak = reading.peak;
             s.scope = reading.scope;
 
-            if let Tick::Dispatched(action) = tick
-                && action.is_loggable()
-            {
-                push_log(&mut s, action);
+            if let Tick::Dispatched(action) = tick {
+                if action.is_loggable() {
+                    push_log(&mut s, action);
+                } else {
+                    s.rearms += 1;
+                    s.last_rearm = Some(format!("{action:?}"));
+                }
             }
         }
 

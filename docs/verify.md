@@ -642,3 +642,85 @@ Session attribution resolved in 0.9s, link up at 1.0s, audio at 1.5s. The
 `Connected, silent` with **zero** recovery events - the conservative default
 declining to reconnect on silence alone, which is the behaviour the pause
 measurements demanded.
+
+---
+
+## Milestone 7 triggers, measured on hardware
+
+One 100s `--run` with the operator switching the PC's default output twice and
+toggling Bluetooth off/on.
+
+### CONFIRMED: `DefaultDeviceChanged` fires, and matters
+
+```
+[  35.9s] re-arm x1 - ReArm(Trigger(DefaultDeviceChanged))
+[  38.0s] Streaming
+[  42.3s] re-arm x1 - ReArm(Trigger(DefaultDeviceChanged))
+[  43.8s] Streaming
+```
+
+Two switches, two triggers, audio back within ~2s each time. The polled
+`DefaultDeviceWatch` is a complete substitute for `IMMNotificationClient` here.
+
+An earlier attempt at this test was **inconclusive** rather than negative, and
+for an instructive reason: a `DefaultDeviceChanged` is a *re-arm*, which is
+deliberately excluded from the reconnect log, so it left no trace at all. The
+snapshot now carries a `rearms` counter and `last_rearm`, printed by `--run`
+but still kept out of the user-facing log. Without that, a trigger that fired
+and a trigger that never registered look identical.
+
+### CONFIRMED: `DeviceChanged` fires at startup
+
+```
+[   2.5s] re-arm x1 - ReArm(Trigger(DeviceChanged))
+```
+
+`DeviceWatcher` reports every already-present device when `Start()` is called,
+so this fires once on launch. Harmless - it is debounced and we were opening
+anyway - but worth knowing it is not a spurious device event.
+
+### NOT CONFIRMED: `RadioToggled` never fired
+
+Bluetooth was toggled off and back on. Registration had reported success, and
+no `Trigger(RadioToggled)` arrived. Every re-arm in the window was
+`LinkClosed`.
+
+Likely cause: the `Radio` object is invalidated when the adapter is disabled,
+so the handler is attached to an object that no longer exists by the time the
+radio returns. Surviving that would need re-enumeration.
+
+`Radio::RequestAccessAsync` has since been added as the documented
+prerequisite, but that is a guess and is **unverified**. The registration is
+kept because it is cheap and may behave differently elsewhere, and `--run` now
+labels it unconfirmed rather than counting it as working.
+
+**It cost nothing**, which is the point below.
+
+### CONFIRMED: the `NoRemote` mapping works in the field
+
+The radio-off window is the best evidence in the log that the earlier
+`0x8007001F` fix was necessary:
+
+```
+[  54.9s] Listening - advertising, waiting for a device
+[  54.9s] re-arm x1 - ReArm(LinkClosed)
+   ... 11 re-arms over ~17 seconds ...
+[  71.4s] re-arm x1 - ReArm(LinkClosed)
+[  71.5s] Connected, silent (degraded - no AVRCP signal)
+[  72.0s] Streaming
+```
+
+Eleven consecutive re-arms with no remote reachable: **zero escalations, zero
+backoff-ladder movement, zero reconnect-log entries**, and recovery 0.6s after
+the radio returned. Before `UnknownFailure`/`0x8007001F` was mapped to
+`Unreachable` -> `NoRemote`, those would have escalated past the threshold of 5
+and ratcheted the ladder toward its 60s cap, turning a half-second recovery
+into a minute-long one.
+
+It also means the radio trigger is not load-bearing: a toggled adapter is
+handled completely by the `LinkClosed` re-arm path.
+
+### STILL UNTESTED
+
+- **Resume from sleep.** Needs the PC actually slept; soak matrix item 2.
+- **`RadioToggled` with `RequestAccessAsync`** in place.

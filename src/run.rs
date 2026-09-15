@@ -29,8 +29,13 @@ pub fn run(secs: u32) -> Result<()> {
     println!("PurpToof --run, {secs}s");
     println!("  device: {}", first.device_name);
     println!(
-        "  triggers: {}/3 event-driven registered, plus default-device polling",
-        first.triggers_registered
+        "  triggers: {}/3 event-driven registered (radio one is unconfirmed); default-device watch {}",
+        first.triggers_registered,
+        if first.device_watch_active {
+            "active"
+        } else {
+            "UNAVAILABLE"
+        }
     );
     println!();
     println!("The PC is now advertising as an A2DP sink and will keep itself");
@@ -43,6 +48,7 @@ pub fn run(secs: u32) -> Result<()> {
     let mut last_status: Option<HealthStatus> = None;
     let mut last_scope: Option<MeterScope> = None;
     let mut logged = 0usize;
+    let mut rearms = 0u64;
 
     while Instant::now() < deadline {
         if !worker.is_running() {
@@ -66,6 +72,17 @@ pub fn run(secs: u32) -> Result<()> {
         if last_scope != Some(snap.scope) {
             println!("[{at:>6.1}s] meter scope: {}", describe_scope(snap.scope));
             last_scope = Some(snap.scope);
+        }
+
+        // Re-arms are benign and stay out of the reconnect log, but printing
+        // them here is the only way to see a trigger actually fire.
+        if snap.rearms > rearms {
+            println!(
+                "[{at:>6.1}s] re-arm x{} - {}",
+                snap.rearms - rearms,
+                snap.last_rearm.as_deref().unwrap_or("?")
+            );
+            rearms = snap.rearms;
         }
 
         for entry in snap.log.iter().skip(logged) {
