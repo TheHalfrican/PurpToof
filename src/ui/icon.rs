@@ -19,7 +19,7 @@
 use eframe::egui::IconData;
 
 /// Edge length of the embedded image. Must match `scripts/make-icon.ps1`.
-const SIZE: u32 = 128;
+const SIZE: u32 = 256;
 
 /// Tightly packed RGBA, row-major, fully opaque.
 const PIXELS: &[u8] = include_bytes!("../../assets/icon.rgba");

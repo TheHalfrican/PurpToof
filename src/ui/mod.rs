@@ -24,6 +24,7 @@
 
 mod app;
 mod icon;
+mod tray;
 
 pub use app::PurpToofApp;
 pub use icon::icon_data;

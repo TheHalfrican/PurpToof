@@ -8,6 +8,7 @@ use crate::core::{Config, HealthStatus, Trigger};
 use crate::platform::meter::MeterScope;
 use crate::platform::worker::{LogEntry, PEAK_HISTORY};
 use crate::platform::{Snapshot, Worker};
+use crate::ui::tray::{Tray, TrayAction};
 
 /// Redraw cadence. Matches the supervisor's 10 Hz tick - drawing faster would
 /// only re-render identical samples and keep a tray-resident app busy for
@@ -15,9 +16,21 @@ use crate::platform::{Snapshot, Worker};
 const REPAINT: Duration = Duration::from_millis(100);
 
 // Dark palette. Compact, no decorative chrome, per CLAUDE.md.
-const BG_METER: Color32 = Color32::from_rgb(24, 24, 28);
-const GRID: Color32 = Color32::from_rgb(48, 48, 54);
-const GREEN: Color32 = Color32::from_rgb(120, 200, 120);
+//
+// The window sits on true black, matching the icon. "Healthy" is deep purple
+// rather than the conventional green - it ties the meter to the app's own
+// colour, and on black a saturated purple carries as well as green does.
+
+/// The window itself. Pitch black, not egui's default charcoal.
+const BG: Color32 = Color32::BLACK;
+/// The meter trough. Lifted a hair off black, with a purple cast, or the
+/// trough vanishes into the window and the meter loses its frame of reference.
+const BG_METER: Color32 = Color32::from_rgb(14, 9, 20);
+const GRID: Color32 = Color32::from_rgb(52, 38, 72);
+/// Audio is flowing. The app's purple, bright enough to read on black.
+const PURPLE: Color32 = Color32::from_rgb(150, 78, 224);
+/// The button, and other quiet chrome.
+const SURFACE: Color32 = Color32::from_rgb(26, 18, 36);
 const AMBER: Color32 = Color32::from_rgb(220, 180, 90);
 const BLUE: Color32 = Color32::from_rgb(120, 170, 220);
 const RED: Color32 = Color32::from_rgb(220, 110, 110);
@@ -31,27 +44,120 @@ pub struct PurpToofApp {
     log: Vec<LogEntry>,
     log_len: usize,
     eps: f32,
+    /// `Err` when the notification area refused us. A missing tray is a
+    /// degraded app, not a dead one - but with close-to-tray on it would be a
+    /// window the user cannot get back, so that setting is forced off.
+    tray: Result<Tray, String>,
+    close_to_tray: bool,
+    visible: bool,
+    /// Whether the initial hide has been applied. eframe has no viewport to
+    /// command until the first frame, so start-minimized cannot be honoured
+    /// in `new`.
+    start_hidden: bool,
 }
 
 impl PurpToofApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        cc.egui_ctx.set_visuals(visuals());
         let eps = config.silence_eps;
+        let tray = Tray::new();
+        if let Err(e) = &tray {
+            tracing::warn!(error = %e, "tray unavailable; close will exit");
+        }
+        // Never trap the window behind a tray that does not exist.
+        let close_to_tray = config.close_to_tray && tray.is_ok();
+        let start_hidden = config.start_minimized && tray.is_ok();
         let worker = Worker::spawn(config).map_err(|e| format!("{e:#}"));
         Self {
             worker,
             log: Vec::new(),
             log_len: 0,
             eps,
+            tray,
+            close_to_tray,
+            visible: !start_hidden,
+            start_hidden,
         }
+    }
+
+    fn show(&mut self, ctx: &egui::Context) {
+        self.visible = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.visible = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// Tray clicks, and the window's own close button.
+    ///
+    /// Returns true if the app should keep running.
+    fn handle_window_and_tray(&mut self, ctx: &egui::Context) -> bool {
+        if self.start_hidden {
+            // First frame: eframe now has a viewport to command.
+            self.start_hidden = false;
+            self.hide(ctx);
+        }
+
+        if let Ok(tray) = &self.tray {
+            match tray.poll() {
+                Some(TrayAction::Quit) => return false,
+                Some(TrayAction::Show) => self.show(ctx),
+                Some(TrayAction::Toggle) => {
+                    if self.visible {
+                        self.hide(ctx);
+                    } else {
+                        self.show(ctx);
+                    }
+                }
+                Some(TrayAction::Reconnect) => {
+                    if let Ok(w) = &self.worker {
+                        w.trigger(Trigger::Manual);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // The close button. With close-to-tray on it hides instead, because
+        // this is a background service with a window attached - closing it
+        // would stop the thing recovering the audio path, which is the entire
+        // point of the app.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.close_to_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide(ctx);
+            } else {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
 impl eframe::App for PurpToofApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The supervisor ticks on its own thread, so nothing here drives it -
-        // this only asks egui to come back and read the next snapshot.
+        // this only asks egui to come back and read the next snapshot. It is
+        // also what keeps the tray responsive while the window is hidden: with
+        // no repaint scheduled, menu clicks would sit unread until something
+        // else woke the loop.
         ui.ctx().request_repaint_after(REPAINT);
+
+        let ctx = ui.ctx().clone();
+        if !self.handle_window_and_tray(&ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Hidden: the supervisor is still running, there is just nothing to
+        // draw. Skipping the body avoids laying out a window nobody sees.
+        if !self.visible {
+            return;
+        }
 
         let worker = match &self.worker {
             Ok(w) => w,
@@ -109,6 +215,34 @@ impl eframe::App for PurpToofApp {
     }
 }
 
+/// Pitch black, with widgets dark enough to sit on it without glowing.
+///
+/// egui's dark theme is charcoal, which reads as grey next to a true-black
+/// icon and title bar.
+fn visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = BG;
+    v.extreme_bg_color = BG_METER;
+    v.faint_bg_color = SURFACE;
+
+    // Buttons and frames. Without this the Reconnect button keeps egui's grey
+    // and is the one obviously non-black thing on screen.
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.bg_fill = SURFACE;
+        w.weak_bg_fill = SURFACE;
+    }
+    v.widgets.hovered.bg_fill = Color32::from_rgb(42, 28, 58);
+    v.widgets.active.bg_fill = Color32::from_rgb(58, 38, 80);
+    v
+}
+
 fn startup_error(ui: &mut egui::Ui, message: &str) {
     ui.add_space(24.0);
     ui.label(RichText::new("Could not start").size(18.0).color(RED));
@@ -142,7 +276,7 @@ fn device_row(ui: &mut egui::Ui, snap: &Snapshot) {
 
 fn link_chip(status: HealthStatus) -> (&'static str, Color32) {
     match status {
-        HealthStatus::Streaming => ("link open", GREEN),
+        HealthStatus::Streaming => ("link open", PURPLE),
         HealthStatus::ConnectedSilent | HealthStatus::Degraded => ("link open", DIM),
         HealthStatus::Listening => ("advertising", BLUE),
         HealthStatus::Reconnecting { .. } => ("reopening", AMBER),
@@ -160,7 +294,7 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
     let level_color = if !trustworthy {
         AMBER
     } else if snap.peak >= eps {
-        GREEN
+        PURPLE
     } else {
         DIM
     };
@@ -243,7 +377,7 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
 
 fn status_line(ui: &mut egui::Ui, snap: &Snapshot) {
     let (text, color) = match snap.status {
-        HealthStatus::Streaming => ("Streaming".to_string(), GREEN),
+        HealthStatus::Streaming => ("Streaming".to_string(), PURPLE),
         HealthStatus::ConnectedSilent => ("Connected, silent".to_string(), DIM),
         HealthStatus::Degraded => ("Connected, silent".to_string(), DIM),
         HealthStatus::Listening => ("Waiting for a device".to_string(), BLUE),

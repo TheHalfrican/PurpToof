@@ -34,6 +34,15 @@ fn default_autostart() -> bool {
 }
 
 fn default_start_minimized() -> bool {
+    // CLAUDE.md's example config shows `start_minimized = true`. Changed on
+    // the user's instruction after using it: launching straight to the tray
+    // gives no confirmation the app came up at all, and the first thing anyone
+    // wants after starting it is to see whether the link is live. Still
+    // available as an option for people who autostart it.
+    false
+}
+
+fn default_close_to_tray() -> bool {
     true
 }
 
@@ -105,6 +114,16 @@ pub struct Config {
 
     #[serde(default = "default_start_minimized")]
     pub start_minimized: bool,
+
+    /// Whether the window's close button hides to the tray instead of exiting.
+    ///
+    /// Defaults to true: this is a background service with a window attached,
+    /// not a document editor. Closing the window when the whole point is to
+    /// keep the audio path alive is almost never what the user meant - and if
+    /// it were, the app would stop recovering the moment they tidied their
+    /// desktop. Quit lives in the tray menu for the times they do mean it.
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
 }
 
 impl Default for Config {
@@ -164,7 +183,13 @@ mod tests {
         assert_eq!(c.trigger_debounce_ms, 750);
         assert_eq!(c.open_transition_timeout_ms, 5_000);
         assert!(c.autostart);
-        assert!(c.start_minimized);
+        assert!(
+            !c.start_minimized,
+            "starting hidden gives no sign it worked"
+        );
+        // Close-to-tray is on by default: this is a background service with a
+        // window attached, and closing the window would stop it recovering.
+        assert!(c.close_to_tray);
     }
 
     #[test]
@@ -233,6 +258,7 @@ mod tests {
             open_transition_timeout_ms: 4_000,
             autostart: false,
             start_minimized: false,
+            close_to_tray: false,
         };
         let text = toml::to_string(&original).expect("must serialise");
         let back: Config = toml::from_str(&text).expect("must round-trip");

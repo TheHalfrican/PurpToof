@@ -19,7 +19,10 @@
 #   3. Downsamples to ICON_SIZE and writes tightly packed RGBA.
 
 param(
-    [int]$IconSize = 128,
+    # 256 rather than 128: Windows downsamples this to 16px for the title bar
+    # and 32-48 for the taskbar, and giving it more to work with keeps the
+    # small sizes from going muddy.
+    [int]$IconSize = 256,
     # Max channel value still considered background. High enough to swallow
     # JPEG noise and the ambient glow, low enough to leave the artwork's own
     # dark purples alone.
@@ -68,8 +71,11 @@ Write-Output "artwork bounds: ($minX,$minY)-($maxX,$maxY)"
 $cw = $maxX - $minX + 1
 $ch = $maxY - $minY + 1
 $side = [Math]::Max($cw, $ch)
-# A little air, or the shape touches the icon edge and looks clipped.
-$side = [int]($side * 1.08)
+# The artwork is tall and narrow - roughly 385x890 in a 1024 canvas - so in a
+# square icon it can only ever fill about 43% of the width. Every pixel of
+# padding is therefore expensive at 16px. Just 2% of air: enough that the shape
+# does not touch the edge, not enough to shrink it further.
+$side = [int]($side * 1.02)
 $cx = $minX + [int]($cw / 2)
 $cy = $minY + [int]($ch / 2)
 $left = [Math]::Max(0, $cx - [int]($side / 2))

@@ -23,6 +23,7 @@ toml = "0.8"
 # can record link transitions before the rolling-file setup arrives at
 # milestone 9 rather than growing print statements that later need removing.
 tracing = "0.1"
+tray-icon = "0.25.0"
 
 [dev-dependencies]
 # Two invariants that table-driven tests cannot express: that no input
