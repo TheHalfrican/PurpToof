@@ -5,8 +5,8 @@ state. If they disagree, this file is newer.
 
 **Last updated:** 2026-09-14
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
-**Tests:** 96 passing, ~0.2s, all on a fake clock
-**Ratio gate:** 2.55:1 on `src/core/` against a 0.9 floor
+**Tests:** 124 passing, ~0.2s, core still all on a fake clock
+**Ratio gate:** passing on `src/core/` against a 0.9 floor
 
 ---
 
@@ -21,9 +21,10 @@ state. If they disagree, this file is newer.
 | 5 | `core/` traits + `FakeConnection` + health state machine | **done** |
 | 6 | `platform/` impls behind the traits, `recover()` wired | **done** — supervisor runs headless via `--run` |
 | 7 | Re-arm triggers | **done** — 3 event-driven + 1 polled, 3/3 registered on hardware |
-| 8 | egui UI + tray | **next** |
-| 9 | Config loading, autostart, logging | `Config` type exists and is tested; no file I/O, no autostart, no `tracing` yet |
-| 10 | Overnight soak → `docs/soak.md` | not started |
+| 8 | egui UI + tray | **done** — window, tray, close-to-tray |
+| 9 | Config, autostart, logging | **done** — TOML, rolling daily log, Run key, settings panel |
+| 10 | Overnight soak → `docs/soak.md` | **the only thing left** |
+| + | Packaging: release build, NSIS + MSI | **done** — both verified install/uninstall |
 
 ### The one settled decision that gates everything
 
@@ -104,33 +105,36 @@ raw tables are in `docs/verify.md`; these are the conclusions that change code.
    holding the sink had closed it. `platform/` must read state from the
    connection it owns.
 
-### Step 1 — milestone 8, egui UI and tray
+### Step 1 — the soak, and nothing else
 
-Milestone 7 is done. `platform/triggers.rs` registers all four; `--run` reports
-how many took.
+Milestones 1-9 are done and the app is packaged. What remains is the one thing
+that cannot be rushed: run it overnight and read the log.
 
-| Trigger | Mechanism | Notes |
-|---|---|---|
-| Resume from sleep | `RegisterSuspendResumeNotification`, `DEVICE_NOTIFY_CALLBACK` | no window, no pump |
-| Bluetooth radio toggled | `Radio::StateChanged` | Bluetooth kind only |
-| Device appears / disappears | `DeviceWatcher` over the selector | fires `Added` for existing devices at `Start()` |
-| Default render device changed | **polled**, 10 Hz id compare | `IMMNotificationClient` needs a COM interface implemented in Rust, and windows 0.62.2 ships no `implement` feature |
+Set up:
 
-The UI now has everything it needs and should stay thin:
+```bash
+pwsh -File scripts/package.ps1      # or just: cargo run
+```
 
-- `Worker::snapshot()` every frame - status, peak, meter scope, device name,
-  trigger count, reconnect log. It is a mutex read of the newest value, so
-  calling it at 60fps is fine.
-- `Worker::trigger(Trigger::Manual)` for the Reconnect button.
-- **eframe owns the main thread; the supervisor already has its own.** Do not
-  move COM work onto the UI thread - the objects are apartment-bound to the
-  worker.
-- Surface `MeterScope`: an `Endpoint` reading is maskable by other apps and the
-  meter is the headline element, so it must not silently lie.
-- `HealthStatus::Degraded` is the normal state on this hardware (no AVRCP), so
-  the degraded banner needs to read as information rather than as an error.
+Then route the phone via **Control Center** (not Settings > Bluetooth - that
+path produces a link that drops on idle) and leave it. In the morning:
 
-### Step 2 — milestone 9 onward
+- `%APPDATA%\PurpToof\logs\purptoof.log.<date>` - the durable record
+- the Reconnect log in the window - genuine recoveries only
+
+Record the result in `docs/soak.md` with the date and build hash, against the
+matrix in CLAUDE.md.
+
+**The specific question the soak answers**, which nothing else can: what a real
+fault looks like. Every other premise in the health model has been measured;
+"a dead audio path presents as `Inactive`" has not, because it cannot be
+produced on demand. The supervisor logs session state alongside the peak, so if
+it happens overnight the answer is in the file.
+
+Also still untested: **resume from sleep**. Soak matrix item 2 - sleep the PC
+five minutes, confirm audio returns with no interaction.
+
+### Step 2 — after the soak
 
 Triggers, then UI, then config file I/O and logging, then soak. The trigger
 plumbing feeds `HealthMonitor::note_trigger`, which already debounces a burst
@@ -197,7 +201,7 @@ Beyond CLAUDE.md's sketch, in ways that matter:
 ## Commands
 
 ```bash
-cargo test                                  # 96 tests, ~0.2s
+cargo test                                  # 124 tests, ~0.2s
 cargo clippy --all-targets -- -D warnings   # what CI gates on
 cargo fmt --check
 pwsh -File scripts/check-test-ratio.ps1     # the 0.9:1 gate on core/
@@ -208,7 +212,9 @@ cargo run --bin spike-a2dp                     # read-only: enumerate + construc
 cargo run --bin spike-a2dp -- --start-only     # exercises the radio, moves no audio
 cargo run --bin spike-a2dp -- --open --hold=N  # OPENS A STREAM — routes phone audio
 cargo run --bin spike-a2dp -- --rearm --hold=N # always-armed sink; also opens a stream
-cargo run --bin purptoof -- --run=300           # THE REAL APP, headless. Routes phone audio.
+cargo run --bin purptoof -- --run=300           # headless supervisor, no window. Routes phone audio.
+cargo run                                      # THE APP (window + tray)
+pwsh -File scripts/package.ps1                 # release build + both installers -> dist/
 ```
 
 `cargo nextest run --no-tests=pass` is what CI runs; nextest is not installed
