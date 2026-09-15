@@ -9,8 +9,9 @@
 //!   every branch lives. Being a library means its items are public API
 //!   rather than dead code waiting to be wired up, so the lint gate stays
 //!   meaningful instead of needing a blanket `allow`.
-//! - `platform/` (milestone 6) implements [`core::traits`] against WinRT, COM
-//!   and Win32, and is kept too thin to be wrong in an interesting way.
+//! - [`platform`] implements [`core::traits`] against WinRT, COM and Win32,
+//!   and is kept too thin to be wrong in an interesting way.
 //! - `ui/` (milestone 8) is egui, and also thin.
 
 pub mod core;
+pub mod platform;

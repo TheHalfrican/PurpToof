@@ -25,11 +25,17 @@
 //! Everything here is read-only. It never advertises a sink, never opens a
 //! stream, and never changes a device. It is safe to run on a machine in use.
 //!
-//! This code will move to `platform/` behind the `AudioMeter` and
-//! `RemotePlayback` traits at milestone 6. It is a flat module for now
-//! because the traits it should implement do not exist yet.
+//! The attribution rule now lives in `platform/a2dp_session.rs`, shared with
+//! the real `AudioMeter`, so the diagnostic and the thing it diagnoses cannot
+//! drift apart.
 
 use anyhow::{Context, Result};
+
+// The attribution rule lives in platform/ so the diagnostic and the real
+// AudioMeter cannot drift apart.
+use purptoof::platform::a2dp_session::{
+    looks_like_a2dp_session, session_identifier, session_instance_identifier,
+};
 use windows::Devices::Enumeration::DeviceInformation;
 use windows::Media::Audio::{AudioPlaybackConnection, AudioPlaybackConnectionState};
 use windows::Media::Control::{
@@ -45,7 +51,7 @@ use windows::Win32::Media::Audio::{
     MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, STGM_READ};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -314,26 +320,6 @@ impl TrackedSession {
     }
 }
 
-/// Render a `PWSTR`-returning session getter, freeing the string afterwards.
-///
-/// These allocate with `CoTaskMemAlloc` and the caller owns the result, so a
-/// single named helper is the only place that ownership rule has to be right.
-///
-/// # Safety
-///
-/// `f` must return a `PWSTR` that the caller owns, or an error.
-unsafe fn pwstr_field(f: impl FnOnce() -> windows::core::Result<PWSTR>) -> String {
-    match f() {
-        Ok(p) if !p.is_null() => unsafe {
-            let s = p.to_string().unwrap_or_else(|e| format!("<{e}>"));
-            CoTaskMemFree(Some(p.0 as *const _));
-            s
-        },
-        Ok(_) => "<null>".into(),
-        Err(e) => format!("<{e}>"),
-    }
-}
-
 /// Best-effort process name for an audio session's owning PID.
 ///
 /// # Safety
@@ -482,14 +468,8 @@ fn report_audio_sessions() -> Result<()> {
             // the PID is neither ours nor unique - but the session identifier
             // embeds the endpoint/device string, which we CAN match against
             // the AudioPlaybackConnection device id.
-            println!(
-                "         id:  {}",
-                pwstr_field(|| control2.GetSessionIdentifier())
-            );
-            println!(
-                "         inst:{}",
-                pwstr_field(|| control2.GetSessionInstanceIdentifier())
-            );
+            println!("         id:  {}", session_identifier(&control2));
+            println!("         inst:{}", session_instance_identifier(&control2));
         }
 
         println!(
@@ -504,23 +484,6 @@ fn report_audio_sessions() -> Result<()> {
 }
 
 // --- `--watch`: a continuous monitor -----------------------------------------
-
-/// Heuristic for "this session is the A2DP render session".
-///
-/// Attribution cannot use the PID: the owner is a protected `svchost.exe` that
-/// `OpenProcess` refuses, and `svchost` would not be unique anyway. The usable
-/// key is the session identifier, which embeds the host binary and a grouping
-/// GUID. On the rig this was observed as
-/// `...\System32\svchost.exe%b{C55CBD10-423D-4D4F-8D35-C4044AA8EBFC}`.
-///
-/// The GUID's stability across reconnects, reboots and machines is NOT
-/// established, so this deliberately matches on the svchost path and treats
-/// the GUID as a tiebreaker only. A caller that finds no match must fall back
-/// to the endpoint meter rather than concluding the stream is dead.
-fn looks_like_a2dp_session(identifier: &str) -> bool {
-    let lower = identifier.to_ascii_lowercase();
-    lower.contains(r"\system32\svchost.exe")
-}
 
 /// One second of observation, rendered as a single line.
 struct WatchTick {
@@ -618,7 +581,7 @@ unsafe fn watch_tick(
                 let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
                     continue;
                 };
-                let id = pwstr_field(|| control2.GetSessionIdentifier());
+                let id = session_identifier(&control2);
                 if looks_like_a2dp_session(&id) {
                     let state = match control.GetState() {
                         Ok(s) if s == AudioSessionStateActive => "Active",
@@ -656,40 +619,5 @@ unsafe fn watch_tick(
             endpoint_peak,
             session: matched.map(|(_, state)| (state, session_peak)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::looks_like_a2dp_session;
-
-    /// The identifier observed on the rig while the phone was streaming.
-    const A2DP: &str = concat!(
-        r"{0.0.0.00000000}.{a1b9084c-5158-4f1e-83ee-848cb39fdf12}|",
-        r"\Device\HarddiskVolume2\Windows\System32\svchost.exe",
-        r"%b{C55CBD10-423D-4D4F-8D35-C4044AA8EBFC}"
-    );
-
-    #[test]
-    fn matches_the_observed_a2dp_session() {
-        assert!(looks_like_a2dp_session(A2DP));
-    }
-
-    #[test]
-    fn does_not_match_ordinary_applications() {
-        for other in [
-            r"{0.0.0.00000000}.{a1b9084c}|\Device\HarddiskVolume2\Program Files (x86)\Steam\steam.exe%b{0}",
-            r"{0.0.0.00000000}.{a1b9084c}|\Device\HarddiskVolume5\SteamLibrary\steamapps\common\Call of Duty 4\iw3sp.exe%b{0}",
-            r"{0.0.0.00000000}.{a1b9084c}|#%b{A9EF3FD9-4240-455E-A4D5-F2B3301887B2}",
-        ] {
-            assert!(!looks_like_a2dp_session(other), "wrongly matched: {other}");
-        }
-    }
-
-    #[test]
-    fn is_case_insensitive_on_the_path() {
-        assert!(looks_like_a2dp_session(
-            r"x|\Device\HarddiskVolume2\WINDOWS\SYSTEM32\SVCHOST.EXE%b{C55CBD10}"
-        ));
     }
 }

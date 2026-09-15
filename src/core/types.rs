@@ -138,6 +138,19 @@ pub enum RecoveryOutcome {
     /// The open failed, or returned success but never transitioned within the
     /// timeout. Both are failures and both advance the ladder.
     Failed,
+    /// The open call completed without error but no remote was there to
+    /// connect - `RequestTimedOut`. **This is not a failure.**
+    ///
+    /// The sink is meant to stay permanently armed, so with the phone out of
+    /// range this is the steady state and can persist for hours. Counting it
+    /// as a failed re-arm would escalate to a recovery, ratchet the backoff
+    /// ladder to its 60s cap, and then respond sluggishly at the moment the
+    /// phone actually comes back - the opposite of what the ladder is for.
+    ///
+    /// Measured on 2026-09-14: an always-armed sink held a link `Opened` for
+    /// 300s across an app switch, the source app being killed, and 97s of
+    /// silence. Re-arming is normal operation, not a symptom.
+    NoRemote,
 }
 
 /// One sample of the world, as seen from outside the connection object.
@@ -158,6 +171,13 @@ pub struct Observation {
 pub enum HealthStatus {
     /// No link.
     Disconnected,
+    /// Advertising as a sink with an open call outstanding, waiting for a
+    /// device that has not arrived.
+    ///
+    /// Distinct from [`HealthStatus::Disconnected`], because nothing is wrong
+    /// and the phone is simply elsewhere. Also distinct from
+    /// [`HealthStatus::Reconnecting`], which implies a fault being repaired.
+    Listening,
     /// Link open and audio is moving. The good state.
     Streaming,
     /// Link open, endpoint quiet, and that is fine - paused, stopped, or a

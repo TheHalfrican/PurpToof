@@ -8,6 +8,10 @@ description = "Windows Bluetooth A2DP audio receiver that recovers itself when t
 anyhow = "1.0.104"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
+# The facade only, for now. It is a no-op without a subscriber, so platform/
+# can record link transitions before the rolling-file setup arrives at
+# milestone 9 rather than growing print statements that later need removing.
+tracing = "0.1"
 
 [dev-dependencies]
 # Two invariants that table-driven tests cannot express: that no input

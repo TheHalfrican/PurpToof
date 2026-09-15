@@ -72,7 +72,15 @@ pub struct HealthMonitor<C: Clock> {
     last_rearm_at: Option<Instant>,
     /// Re-arms since flow was last actually observed. Escalates to a real
     /// recovery past the threshold so the ladder takes over.
+    ///
+    /// Reset by [`RecoveryOutcome::NoRemote`]: waiting for an absent phone is
+    /// not a failing re-arm, and must never drive escalation.
     consecutive_rearms: u32,
+
+    /// Whether the last arm completed with no remote present, i.e. we are
+    /// advertising and waiting rather than repairing anything. Drives
+    /// [`HealthStatus::Listening`].
+    listening: bool,
 
     /// First trigger of a burst, plus when it arrived. Everything else in the
     /// burst folds into this one entry, which is what the debounce is.
@@ -95,6 +103,7 @@ impl<C: Clock> HealthMonitor<C> {
             in_flight_recovery: false,
             last_rearm_at: None,
             consecutive_rearms: 0,
+            listening: false,
             pending_trigger: None,
             last_obs: None,
         }
@@ -154,6 +163,12 @@ impl<C: Clock> HealthMonitor<C> {
         // Real audio proves whatever we last did actually worked.
         if audible && obs.link == LinkState::Opened {
             self.consecutive_rearms = 0;
+        }
+
+        // A live link means a remote did arrive, so we are no longer merely
+        // advertising into an empty room.
+        if obs.link == LinkState::Opened {
+            self.listening = false;
         }
 
         // --- silence bookkeeping ------------------------------------------
@@ -237,11 +252,28 @@ impl<C: Clock> HealthMonitor<C> {
         // the next sample look instantly overdue.
         self.playing_silent_since = None;
 
-        if outcome == RecoveryOutcome::Failed {
-            // The ladder already advanced when the action was emitted, so the
-            // spacing is in place. Nothing further to do - and deliberately
-            // no reset, because a failure is not evidence of health.
-            self.healthy_since = None;
+        match outcome {
+            RecoveryOutcome::Failed => {
+                // The ladder already advanced when the action was emitted, so
+                // the spacing is in place. Nothing further to do - and
+                // deliberately no reset, because a failure is not evidence of
+                // health.
+                self.healthy_since = None;
+            }
+            RecoveryOutcome::NoRemote => {
+                // Armed and waiting. Not a failure, so it must not count
+                // toward escalation: with the phone out of range this repeats
+                // indefinitely, and escalating would drive the ladder to its
+                // cap and leave us sluggish exactly when the phone returns.
+                self.consecutive_rearms = 0;
+                self.healthy_since = None;
+                self.listening = true;
+            }
+            RecoveryOutcome::Succeeded => {}
+        }
+
+        if outcome != RecoveryOutcome::NoRemote {
+            self.listening = false;
         }
     }
 
@@ -256,10 +288,18 @@ impl<C: Clock> HealthMonitor<C> {
             };
         }
         match self.last_obs {
+            None if self.listening => HealthStatus::Listening,
             None => HealthStatus::Disconnected,
             Some(obs) => {
                 if obs.link == LinkState::Closed {
-                    HealthStatus::Disconnected
+                    // Armed and waiting is not the same as disconnected. The
+                    // sink is advertising with an open call outstanding; the
+                    // phone is simply elsewhere, and nothing needs repairing.
+                    if self.listening {
+                        HealthStatus::Listening
+                    } else {
+                        HealthStatus::Disconnected
+                    }
                 } else if obs.peak >= self.config.silence_eps {
                     // Audio is moving. Say so even when Signal B is missing -
                     // the degraded banner is a separate piece of UI, and
@@ -619,6 +659,135 @@ mod tests {
         // Past the floor: allowed.
         clock.advance_ms(1_000);
         assert!(matches!(m.observe(closed), Action::ReArm(_)));
+    }
+
+    // --- armed and waiting is not a fault -----------------------------------
+    //
+    // The sink is meant to stay permanently armed, so with the phone out of
+    // range `Open()` returns `RequestTimedOut` indefinitely. Treating that as
+    // a failing re-arm escalates to a recovery, drives the ladder to its 60s
+    // cap, and leaves the app sluggish at the exact moment the phone returns.
+
+    #[test]
+    fn waiting_for_an_absent_remote_never_escalates() {
+        let clock = FakeClock::new();
+        let mut m = monitor(&clock);
+        let closed = obs(LinkState::Closed, None, SILENT);
+
+        // Far past the escalation threshold. A phone in another room for an
+        // hour must never look like a fault.
+        for i in 0..(config().rearm_escalation_threshold * 20) {
+            clock.advance_secs(2);
+            let action = m.observe(closed);
+            assert!(
+                matches!(action, Action::ReArm(_)),
+                "arm {i} should stay a benign re-arm, got {action:?}"
+            );
+            m.recovery_finished(RecoveryOutcome::NoRemote);
+        }
+
+        assert!(
+            m.backoff().is_reset(),
+            "the ladder must never advance while merely waiting for a remote"
+        );
+    }
+
+    #[test]
+    fn no_remote_reports_listening_rather_than_disconnected() {
+        let clock = FakeClock::new();
+        let mut m = monitor(&clock);
+
+        clock.advance_secs(2);
+        m.observe(obs(LinkState::Closed, None, SILENT));
+        m.recovery_finished(RecoveryOutcome::NoRemote);
+        clock.advance_secs(2);
+        m.observe(obs(LinkState::Closed, None, SILENT));
+
+        assert_eq!(
+            m.status(),
+            HealthStatus::Listening,
+            "advertising into an empty room is not the same as Disconnected"
+        );
+    }
+
+    #[test]
+    fn a_live_link_clears_listening() {
+        let clock = FakeClock::new();
+        let mut m = monitor(&clock);
+
+        clock.advance_secs(2);
+        m.observe(obs(LinkState::Closed, None, SILENT));
+        m.recovery_finished(RecoveryOutcome::NoRemote);
+        assert_eq!(m.status(), HealthStatus::Listening);
+
+        clock.advance_secs(2);
+        m.observe(obs(
+            LinkState::Opened,
+            Some(PlaybackStatus::Playing),
+            AUDIBLE,
+        ));
+        assert_eq!(m.status(), HealthStatus::Streaming);
+    }
+
+    #[test]
+    fn a_real_failure_after_waiting_still_escalates() {
+        // NoRemote resets the counter, but it must not make the app immune to
+        // genuine failures afterwards - a phone that connects and then cannot
+        // hold a link is still a fault.
+        let clock = FakeClock::new();
+        let mut m = monitor(&clock);
+        let closed = obs(LinkState::Closed, Some(PlaybackStatus::Playing), SILENT);
+
+        for _ in 0..3 {
+            clock.advance_secs(2);
+            m.observe(closed);
+            m.recovery_finished(RecoveryOutcome::NoRemote);
+        }
+
+        let threshold = config().rearm_escalation_threshold;
+        for i in 0..threshold {
+            clock.advance_secs(2);
+            let action = m.observe(closed);
+            assert!(
+                matches!(action, Action::ReArm(_)),
+                "re-arm {i} should still be benign, got {action:?}"
+            );
+            m.recovery_finished(RecoveryOutcome::Failed);
+        }
+
+        clock.advance_secs(2);
+        match m.observe(closed) {
+            Action::Recover(RecoveryReason::ReArmExhausted { attempts }) => {
+                assert_eq!(attempts, threshold);
+            }
+            other => panic!("expected escalation after real failures, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waiting_interleaved_with_failures_does_not_mask_them() {
+        // The pathological ordering: a NoRemote between every failure would
+        // reset the counter forever and make escalation unreachable. That is
+        // correct - each NoRemote is evidence the phone genuinely was not
+        // there - so assert the behaviour explicitly rather than leave it to
+        // be discovered.
+        let clock = FakeClock::new();
+        let mut m = monitor(&clock);
+        let closed = obs(LinkState::Closed, Some(PlaybackStatus::Playing), SILENT);
+
+        for _ in 0..(config().rearm_escalation_threshold * 3) {
+            clock.advance_secs(2);
+            assert!(matches!(m.observe(closed), Action::ReArm(_)));
+            m.recovery_finished(RecoveryOutcome::Failed);
+            clock.advance_secs(2);
+            assert!(matches!(m.observe(closed), Action::ReArm(_)));
+            m.recovery_finished(RecoveryOutcome::NoRemote);
+        }
+
+        assert!(
+            m.backoff().is_reset(),
+            "alternating with NoRemote keeps the ladder reset by design"
+        );
     }
 
     #[test]
