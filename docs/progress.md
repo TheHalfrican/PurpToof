@@ -20,8 +20,8 @@ state. If they disagree, this file is newer.
 | 4 | `--debug-sessions`, resolve both VERIFY items | **done — both VERIFY items resolved 2026-09-14** |
 | 5 | `core/` traits + `FakeConnection` + health state machine | **done** |
 | 6 | `platform/` impls behind the traits, `recover()` wired | **done** — supervisor runs headless via `--run` |
-| 7 | Re-arm triggers | **next** |
-| 8 | egui UI + tray | not started |
+| 7 | Re-arm triggers | **done** — 3 event-driven + 1 polled, 3/3 registered on hardware |
+| 8 | egui UI + tray | **next** |
 | 9 | Config loading, autostart, logging | `Config` type exists and is tested; no file I/O, no autostart, no `tracing` yet |
 | 10 | Overnight soak → `docs/soak.md` | not started |
 
@@ -104,29 +104,33 @@ raw tables are in `docs/verify.md`; these are the conclusions that change code.
    holding the sink had closed it. `platform/` must read state from the
    connection it owns.
 
-### Step 1 — milestone 7, the four re-arm triggers
+### Step 1 — milestone 8, egui UI and tray
 
-The groundwork is done. `platform/worker.rs` runs the supervisor on its own
-**MTA** thread behind a channel boundary, so all four triggers can be
-callback-based with **no message pump** - an earlier note here claimed
-otherwise and was wrong. Each callback should do nothing but post
-`Command::Trigger`; `IMMNotificationClient` in particular must not block or
-re-enter the enumerator.
+Milestone 7 is done. `platform/triggers.rs` registers all four; `--run` reports
+how many took.
 
-| Trigger | Mechanism |
-|---|---|
-| Resume from sleep | `RegisterSuspendResumeNotification` with `DEVICE_NOTIFY_CALLBACK` |
-| Bluetooth radio toggled | `Windows.Devices.Radios.Radio::StateChanged` |
-| Default render device changed | `IMMNotificationClient::OnDefaultDeviceChanged` |
-| Device appears / disappears | `DeviceWatcher` over the playback-connection selector |
+| Trigger | Mechanism | Notes |
+|---|---|---|
+| Resume from sleep | `RegisterSuspendResumeNotification`, `DEVICE_NOTIFY_CALLBACK` | no window, no pump |
+| Bluetooth radio toggled | `Radio::StateChanged` | Bluetooth kind only |
+| Device appears / disappears | `DeviceWatcher` over the selector | fires `Added` for existing devices at `Start()` |
+| Default render device changed | **polled**, 10 Hz id compare | `IMMNotificationClient` needs a COM interface implemented in Rust, and windows 0.62.2 ships no `implement` feature |
 
-`Trigger::DefaultDeviceChanged` already rebinds the meter via
-`AudioMeter::rebind`; the trigger plumbing only has to deliver it.
+The UI now has everything it needs and should stay thin:
 
-Note the device still enumerates with the phone's radio **off**, so
-`DeviceChanged` will not fire merely because the phone was switched off.
+- `Worker::snapshot()` every frame - status, peak, meter scope, device name,
+  trigger count, reconnect log. It is a mutex read of the newest value, so
+  calling it at 60fps is fine.
+- `Worker::trigger(Trigger::Manual)` for the Reconnect button.
+- **eframe owns the main thread; the supervisor already has its own.** Do not
+  move COM work onto the UI thread - the objects are apartment-bound to the
+  worker.
+- Surface `MeterScope`: an `Endpoint` reading is maskable by other apps and the
+  meter is the headline element, so it must not silently lie.
+- `HealthStatus::Degraded` is the normal state on this hardware (no AVRCP), so
+  the degraded banner needs to read as information rather than as an error.
 
-### Step 2 — milestone 8 onward
+### Step 2 — milestone 9 onward
 
 Triggers, then UI, then config file I/O and logging, then soak. The trigger
 plumbing feeds `HealthMonitor::note_trigger`, which already debounces a burst

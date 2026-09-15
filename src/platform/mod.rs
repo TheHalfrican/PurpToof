@@ -21,6 +21,7 @@ pub mod a2dp_session;
 pub mod meter;
 pub mod remote;
 pub mod sink;
+pub mod triggers;
 pub mod worker;
 
 pub use meter::{MeterReading, MeterScope, WasapiMeter};

@@ -35,6 +35,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 
 use crate::core::{Action, Config, HealthStatus, Supervisor, SystemClock, Tick, Trigger};
 use crate::platform::meter::MeterScope;
+use crate::platform::triggers::{DefaultDeviceWatch, Triggers};
 use crate::platform::{GsmtcRemote, Sink, WasapiMeter};
 
 /// The poll rate the whole design assumes: fast enough to notice a dead path
@@ -77,6 +78,10 @@ pub struct Snapshot {
     pub peak: f32,
     pub scope: MeterScope,
     pub device_name: String,
+    /// How many of the three event-driven triggers registered. Surfaced because
+    /// a missing one silently degrades recovery, and "it stopped waking up
+    /// after sleep" is otherwise very hard to diagnose.
+    pub triggers_registered: usize,
     pub log: Vec<LogEntry>,
 }
 
@@ -87,6 +92,7 @@ impl Default for Snapshot {
             peak: 0.0,
             scope: MeterScope::Endpoint,
             device_name: String::new(),
+            triggers_registered: 0,
             log: Vec::new(),
         }
     }
@@ -115,10 +121,18 @@ impl Worker {
         let thread_shared = Arc::clone(&shared);
         let thread_running = Arc::clone(&running);
 
+        let trigger_tx = commands.clone();
         let join = std::thread::Builder::new()
             .name("purptoof-supervisor".into())
             .spawn(move || {
-                worker_main(config, rx, thread_shared, thread_running, ready_tx);
+                worker_main(
+                    config,
+                    rx,
+                    trigger_tx,
+                    thread_shared,
+                    thread_running,
+                    ready_tx,
+                );
             })
             .context("could not spawn the supervisor thread")?;
 
@@ -174,6 +188,7 @@ impl Drop for Worker {
 fn worker_main(
     config: Config,
     commands: Receiver<Command>,
+    trigger_tx: Sender<Command>,
     shared: Arc<Mutex<Snapshot>>,
     running: Arc<AtomicBool>,
     ready: Sender<std::result::Result<(), String>>,
@@ -208,9 +223,33 @@ fn worker_main(
     }
 
     let mut sup = Supervisor::new(SystemClock, config, sink, meter, remote);
+
+    // Registered after the supervisor exists so a trigger arriving instantly -
+    // a device watcher reports every already-present device on Start - finds a
+    // channel someone is draining.
+    let triggers = unsafe { Triggers::register(trigger_tx) };
+    let mut device_watch = match unsafe { DefaultDeviceWatch::new() } {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!(error = %e, "default-device watch unavailable");
+            None
+        }
+    };
+    if let Ok(mut s) = shared.lock() {
+        s.triggers_registered = triggers.registered();
+    }
+
     let _ = ready.send(Ok(()));
 
     while let ControlFlow::Continue = drain_commands(&commands, &mut sup) {
+        // Polled rather than event-driven; see DefaultDeviceWatch. Checked
+        // before the tick so a change is acted on this pass rather than next.
+        if let Some(watch) = &mut device_watch
+            && watch.changed()
+        {
+            sup.note_trigger(Trigger::DefaultDeviceChanged);
+        }
+
         let tick = sup.tick();
         let reading = sup.meter().read();
 
@@ -228,6 +267,10 @@ fn worker_main(
 
         std::thread::sleep(POLL);
     }
+
+    // Unregister before the COM teardown below, so no callback can fire into
+    // an apartment that is going away.
+    drop(triggers);
 
     running.store(false, Ordering::Relaxed);
     unsafe { CoUninitialize() };

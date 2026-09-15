@@ -57,6 +57,15 @@ features = [
     "Win32_System_Threading",
     # CloseHandle for the above.
     "Win32_Foundation",
+    # Re-arm trigger: RegisterSuspendResumeNotification. The DEVICE_NOTIFY_CALLBACK
+    # form, which needs no window handle and therefore no message pump.
+    "Win32_System_Power",
+    # Re-arm trigger: Radio::StateChanged, for the Bluetooth adapter being
+    # toggled from Action Center.
+    "Devices_Radios",
+    # RegisterSuspendResumeNotification and DEVICE_NOTIFY_CALLBACK live behind
+    # this gate even in their window-free form.
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 # Match Lockstep: keep this crate cheap to debug while dependencies stay

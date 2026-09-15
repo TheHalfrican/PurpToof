@@ -28,6 +28,10 @@ pub fn run(secs: u32) -> Result<()> {
     let first = worker.snapshot();
     println!("PurpToof --run, {secs}s");
     println!("  device: {}", first.device_name);
+    println!(
+        "  triggers: {}/3 event-driven registered, plus default-device polling",
+        first.triggers_registered
+    );
     println!();
     println!("The PC is now advertising as an A2DP sink and will keep itself");
     println!("armed. Route audio to this PC from Control Center - not Settings >");
