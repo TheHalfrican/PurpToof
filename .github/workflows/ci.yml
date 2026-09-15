@@ -33,7 +33,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: taiki-e/install-action@nextest
+      # Deliberately NOT taiki-e/install-action@nextest. That action shells out
+      # to bash and then looks for a sentinel file under %USERPROFILE%, but a
+      # self-hosted runner overrides HOME for job steps, so the sentinel lands
+      # elsewhere and it retries ten times before reporting a "bash startup
+      # failure" that never happened. Gitea CI failed this way from the very
+      # first push. The prebuilt binary needs no bash and behaves the same on
+      # hosted and self-hosted runners.
+      - name: Install cargo-nextest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = "$env:USERPROFILE\.cargo\bin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'nextest.zip'
+          Invoke-WebRequest -Uri 'https://get.nexte.st/latest/windows' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          & "$dest\cargo-nextest.exe" nextest --version
 
       - name: Check formatting
         run: cargo fmt --check
