@@ -78,3 +78,27 @@ jobs:
       - name: Test-to-production ratio gate (core/ only)
         shell: pwsh
         run: ./scripts/check-test-ratio.ps1
+
+      # A release build exercises LTO, the build script's resource embedding and
+      # panic=abort, none of which the debug build touches - so a packaging
+      # break would otherwise only surface when cutting a release.
+      - name: Release build
+        run: cargo build --release
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          dotnet tool install --global wix --version 5.0.2
+
+      - name: Build installers
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: |
+            dist/*.exe
+            dist/*.msi
+          if-no-files-found: error

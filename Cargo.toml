@@ -7,6 +7,10 @@ description = "Windows Bluetooth A2DP audio receiver that recovers itself when t
 # bare `cargo run` launches.
 default-run = "purptoof"
 
+[build-dependencies]
+# Compiles the .ico and the version block into the exe.
+winresource = "0.1"
+
 [dependencies]
 anyhow = "1.0.104"
 # The window. default-features off because the defaults pull in accesskit and
@@ -83,6 +87,9 @@ features = [
     "Devices_Radios",
     # Autostart: the per-user Run key.
     "Win32_System_Registry",
+    # AttachConsole, so a GUI-subsystem release build can still print
+    # diagnostics when launched from a terminal.
+    "Win32_System_Console",
     # RegisterSuspendResumeNotification and DEVICE_NOTIFY_CALLBACK live behind
     # this gate even in their window-free form.
     "Win32_UI_WindowsAndMessaging",
@@ -93,6 +100,19 @@ features = [
 # dependency tree makes timing observations in a debug build meaningless.
 [profile.dev]
 debug = "line-tables-only"
+
+# Shipping profile. This runs unattended for hours next to an audio path, so
+# the trade is size and predictability over build time.
+[profile.release]
+# One codegen unit plus fat LTO: the hot path is a 10 Hz poll, and the win here
+# is a smaller binary rather than speed.
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+# Abort rather than unwind. A panic in the supervisor thread would otherwise
+# unwind into a half-torn-down COM apartment; failing loudly and immediately is
+# easier to diagnose from a log than whatever comes after that.
+panic = "abort"
 
 [profile.dev.package."*"]
 opt-level = 2

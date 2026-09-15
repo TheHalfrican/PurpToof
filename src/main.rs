@@ -4,6 +4,11 @@
 //! Thin by design: argument dispatch, and the decision of which thread gets
 //! which COM apartment. Everything else lives in the library.
 
+// Release builds are GUI-subsystem, so launching from Explorer or a shortcut
+// does not flash a console window. Debug builds keep the console, which is
+// where the diagnostics are read during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use purptoof::core::{Config, Paths};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
@@ -14,7 +19,27 @@ mod debug_sessions;
 mod logging;
 mod run;
 
+/// Reattach to the launching terminal, if there was one.
+///
+/// A GUI-subsystem binary has no console, so `--debug-sessions` and `--watch`
+/// would print into the void when run from a shell in a release build. This
+/// borrows the parent's console when one exists and is a no-op otherwise, so
+/// the diagnostics keep working without costing every Explorer launch a
+/// flashing black window.
+#[cfg(not(debug_assertions))]
+fn attach_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn attach_console() {}
+
 fn main() -> Result<()> {
+    attach_console();
+
     // NOTE: COM is deliberately NOT initialized here.
     //
     // winit calls `OleInitialize`, which requires an STA. Initializing this

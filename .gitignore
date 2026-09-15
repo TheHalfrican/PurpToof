@@ -1,2 +1,6 @@
 /target
 .claude/settings.local.json
+
+# Build output from scripts/package.ps1. The installers are release artifacts,
+# published from CI rather than committed.
+/dist/

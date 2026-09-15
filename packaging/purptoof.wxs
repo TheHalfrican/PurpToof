@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI for PurpToof, built with WiX v4:
+
+      wix build packaging\purptoof.wxs -ext WixToolset.Util.wixext -o dist\PurpToof-0.1.0.msi
+
+  Source paths are relative to the REPOSITORY ROOT, not to this file: WiX
+  resolves them against the working directory. Build via scripts/package.ps1,
+  which runs everything from the right place.
+
+  Per-user, like the NSIS installer, and for the same reasons: no elevation
+  needed, and everything the app does (its default audio output, its autostart
+  Run key, its settings) is already per-user.
+
+  The MSI exists alongside the NSIS one because they answer different needs.
+  NSIS is the friendlier download for a person; an MSI is what Intune, Group
+  Policy and `msiexec /qn` want for unattended deployment.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="PurpToof"
+      Manufacturer="TheHalfrican"
+      Version="!(bind.FileVersion.PurpToofExe)"
+      UpgradeCode="5f3a1d84-9c2b-4a77-8e61-2b0d6f4c9a13"
+      Scope="perUser"
+      Compressed="yes">
+
+    <!--
+      Remove the old version before laying down the new one. Without this a
+      second install of the same UpgradeCode leaves two Add/Remove entries and
+      an exe from whichever finished last.
+    -->
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of PurpToof is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Stop a running instance. Windows Installer cannot replace a locked file,
+      and without this an upgrade over a running tray app either prompts for a
+      reboot or silently keeps the old binary.
+    -->
+    <util:CloseApplication
+        xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+        Id="ClosePurpToof"
+        Target="purptoof.exe"
+        CloseMessage="yes"
+        RebootPrompt="no"
+        TerminateProcess="1" />
+
+    <Icon Id="PurpToofIcon" SourceFile="assets\purptoof.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PurpToofIcon" />
+    <!--
+      Without this the Add/Remove entry shows no install path, which makes it
+      look like a broken registration and gives the user no way to find the
+      files.
+    -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="PurpToof" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="PurpToof" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="PurpToof" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="CleanAutostart" />
+    </Feature>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="8c1e5b26-3f4a-4d90-b7c2-1a6e8d0f5b47">
+        <File Id="PurpToofExe" Source="target\release\purptoof.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="IconFile" Guid="a2d7f018-6b53-4e1c-9f82-3c7b5e2a0d96">
+        <File Id="PurpToofIcoFile" Source="assets\purptoof.ico" KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseFile" Guid="d4b90e77-1c62-4a58-83f1-9e05c7b62f4a">
+        <File Id="LicenseTxt" Source="LICENSE" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="AppMenuFolder"
+               Guid="6e0c3a95-8d41-42b7-a5f9-0b8d2e14c7d3">
+      <Shortcut Id="AppShortcut"
+                Name="PurpToof"
+                Description="Bluetooth audio receiver that recovers itself"
+                Target="[INSTALLFOLDER]purptoof.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="PurpToofIcon" />
+      <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+      <!--
+        A per-user shortcut needs a per-user KeyPath, and a registry value is
+        the conventional one - a file KeyPath in the Start Menu would make the
+        component's install state depend on a shortcut the user may delete.
+      -->
+      <RegistryValue Root="HKCU" Key="Software\TheHalfrican\PurpToof"
+                     Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      The app writes its own autostart Run key. Remove it on uninstall, or it
+      points at a deleted exe and fails silently at every login.
+    -->
+    <Component Id="CleanAutostart" Directory="INSTALLFOLDER"
+               Guid="0f7a4c81-5e93-4b26-9d17-6a2c8f3b5e04">
+      <RegistryValue Root="HKCU" Key="Software\TheHalfrican\PurpToof"
+                     Name="cleanup" Type="integer" Value="1" KeyPath="yes" />
+      <RemoveRegistryValue Root="HKCU"
+                           Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                           Name="PurpToof" />
+    </Component>
+
+    <!--
+      Settings and logs under %APPDATA%\PurpToof are deliberately not removed.
+      A reinstall should not lose configuration, and the logs are the record of
+      what the app did - the thing you most want to keep after uninstalling
+      something that misbehaved.
+    -->
+  </Package>
+</Wix>

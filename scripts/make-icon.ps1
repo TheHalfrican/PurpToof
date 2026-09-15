@@ -126,3 +126,59 @@ $icon.Dispose()
 
 Write-Output "wrote $outRgba ($($bytes.Length) bytes, ${IconSize}x${IconSize} RGBA)"
 Write-Output "wrote $outPreview"
+
+# --- 4. a real .ico for the executable and the installers ---------------------
+#
+# The embedded RGBA above is what eframe draws in the title bar. Windows itself
+# - Explorer, the Start menu, Add/Remove Programs, the installer's own UI - all
+# read an .ico resource compiled into the exe, and none of them can see the
+# eframe icon. Without this the app is a generic blank page everywhere outside
+# its own window.
+#
+# Written by hand because .NET cannot save a multi-size ICO. The format is a
+# small header plus, since Vista, ordinary PNGs - so each size is a PNG and the
+# directory just points at them.
+$icoPath = Join-Path $root 'assets\purptoof.ico'
+$sizes = @(16, 24, 32, 48, 64, 128, 256)
+
+$pngs = @()
+foreach ($sz in $sizes) {
+    $b = New-Object System.Drawing.Bitmap $sz, $sz, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $gg = [System.Drawing.Graphics]::FromImage($b)
+    $gg.InterpolationMode = 'HighQualityBicubic'
+    $gg.PixelOffsetMode = 'HighQuality'
+    $gg.Clear([System.Drawing.Color]::Black)
+    $srcIcon = [System.Drawing.Image]::FromFile($outPreview)
+    $gg.DrawImage($srcIcon, 0, 0, $sz, $sz)
+    $srcIcon.Dispose(); $gg.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $b.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $b.Dispose()
+    $pngs += , @{ Size = $sz; Bytes = $ms.ToArray() }
+    $ms.Dispose()
+}
+
+$out = New-Object System.IO.MemoryStream
+$bw = New-Object System.IO.BinaryWriter($out)
+$bw.Write([UInt16]0)                 # reserved
+$bw.Write([UInt16]1)                 # type: icon
+$bw.Write([UInt16]$pngs.Count)
+# Entries are fixed-width, so every image offset is known before any is written.
+$offset = 6 + (16 * $pngs.Count)
+foreach ($png in $pngs) {
+    # 256 is encoded as 0 in a single byte, which is the one quirk of the format.
+    $dim = if ($png.Size -ge 256) { 0 } else { $png.Size }
+    $bw.Write([Byte]$dim); $bw.Write([Byte]$dim)
+    $bw.Write([Byte]0)               # palette entries
+    $bw.Write([Byte]0)               # reserved
+    $bw.Write([UInt16]1)             # colour planes
+    $bw.Write([UInt16]32)            # bits per pixel
+    $bw.Write([UInt32]$png.Bytes.Length)
+    $bw.Write([UInt32]$offset)
+    $offset += $png.Bytes.Length
+}
+foreach ($png in $pngs) { $bw.Write($png.Bytes) }
+$bw.Flush()
+[System.IO.File]::WriteAllBytes($icoPath, $out.ToArray())
+$bw.Dispose(); $out.Dispose()
+Write-Output "wrote $icoPath ($((Get-Item $icoPath).Length) bytes, $($sizes -join '/')px)"
