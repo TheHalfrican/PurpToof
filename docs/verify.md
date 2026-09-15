@@ -662,6 +662,18 @@ toggling Bluetooth off/on.
 Two switches, two triggers, audio back within ~2s each time. The polled
 `DefaultDeviceWatch` is a complete substitute for `IMMNotificationClient` here.
 
+**But it costs a manual play press.** The operator reports that on every
+switch the audio returned to the *correct* new output, and that the iPhone
+paused itself and had to be restarted by hand. That follows from the mechanism:
+moving the render target requires closing and reopening the connection, iOS
+sees the A2DP stream disappear, and it pauses. There is no way to move the
+target without the reopen, so this is a property of the API rather than
+something to fix.
+
+The UI should say so rather than let it surprise people - a switch that
+silently pauses their music looks like a bug even though the recovery worked
+perfectly.
+
 An earlier attempt at this test was **inconclusive** rather than negative, and
 for an instructive reason: a `DefaultDeviceChanged` is a *re-arm*, which is
 deliberately excluded from the reconnect log, so it left no trace at all. The
