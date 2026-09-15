@@ -147,25 +147,36 @@ where
         }
     }
 
-    /// Tear the connection down and open it again.
-    ///
-    /// `close()` is called unconditionally and explicitly rather than relying
-    /// on `Drop`, per CLAUDE.md - reopening without closing is how a stale
-    /// half-open connection survives a recovery that was supposed to replace
-    /// it.
+    /// Carry out whatever the state machine asked for.
     fn dispatch(&mut self, action: Action) {
         // The render target follows a reopen; the METER does not. It binds its
         // endpoint once at construction, so after a default-device change a
         // re-armed link would play fine while the meter read the old endpoint
         // and reported silence forever.
-        if matches!(
+        let device_changed = matches!(
             action,
             Action::ReArm(ReArmReason::Trigger(Trigger::DefaultDeviceChanged))
-        ) {
+        );
+        if device_changed {
             self.meter.rebind();
         }
 
-        self.sink.close();
+        // Closing is DISCARDING - on real hardware an AudioPlaybackConnection
+        // cannot be reopened after a close, and reusing one returns
+        // DeniedBySystem forever. So tear down only when tearing down is the
+        // point:
+        //
+        // - a genuine recovery, which is what CLAUDE.md's recover() describes:
+        //   drop the connection, release the interfaces, re-run the lifecycle.
+        // - a default-device change, because the render target is bound when
+        //   the connection opens and does not follow the system default.
+        //
+        // A benign re-arm just reopens the live connection, which is measurably
+        // fine and far cheaper - the --rearm spike did exactly that across many
+        // arms without a single close.
+        if matches!(action, Action::Recover(_)) || device_changed {
+            self.sink.close();
+        }
         match self.sink.open() {
             Ok(()) => self.awaiting_open = Some(self.clock.now()),
             // Both mean "no remote", and neither is a fault. They are kept
@@ -423,6 +434,72 @@ mod tests {
             s.tick();
         }
         assert_eq!(s.meter().rebinds(), 0);
+    }
+
+    #[test]
+    fn a_benign_rearm_does_not_tear_the_connection_down() {
+        // Closing is discarding: on real hardware a closed
+        // AudioPlaybackConnection cannot be reopened and returns
+        // DeniedBySystem forever. A re-arm happens every time the link drops
+        // in ordinary use, so tearing down here would churn the radio for no
+        // reason - and was an access violation before close() learned to be a
+        // no-op on a never-started object.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::healthy(),
+            FakeMeter::silent(),
+            FakeRemote::unavailable(),
+        );
+
+        clock.advance_secs(1);
+        assert!(matches!(s.tick(), Tick::Dispatched(Action::ReArm(_))));
+        assert_eq!(s.sink().open_calls(), 1);
+        assert_eq!(s.sink().close_calls(), 0, "a re-arm must not discard");
+    }
+
+    #[test]
+    fn a_recovery_does_tear_the_connection_down() {
+        // The other half: recover() means drop the connection and re-run the
+        // lifecycle, which is the only way a wedged link actually comes back.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::already_open(),
+            FakeMeter::silent(),
+            FakeRemote::playing(),
+        );
+
+        // The silence condition starts on the first observation, so the
+        // timeout is measured from there, not from construction.
+        clock.advance_secs(1);
+        assert_eq!(s.tick(), Tick::Idle);
+
+        clock.advance_secs(7);
+        assert!(matches!(s.tick(), Tick::Dispatched(Action::Recover(_))));
+        assert_eq!(s.sink().close_calls(), 1);
+    }
+
+    #[test]
+    fn a_default_device_change_tears_down_too() {
+        // The render target is bound when the connection opens and does not
+        // follow the system default, so this one needs a real reopen rather
+        // than another Open() on the same object.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::already_open(),
+            FakeMeter::with_peak(0.4),
+            FakeRemote::playing(),
+        );
+
+        clock.advance_secs(1);
+        s.tick();
+        s.note_trigger(Trigger::DefaultDeviceChanged);
+        clock.advance_secs(2);
+        assert!(matches!(s.tick(), Tick::Dispatched(Action::ReArm(_))));
+        assert_eq!(s.sink().close_calls(), 1);
+        assert_eq!(s.meter().rebinds(), 1);
     }
 
     #[test]

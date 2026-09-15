@@ -91,24 +91,67 @@ fn classify_unknown_failure(extended: Option<windows::core::HRESULT>) -> SinkErr
     }
 }
 
-pub struct Sink {
+/// A live connection object plus its event-handler token.
+///
+/// Held together because they are created and destroyed as a unit: the token
+/// is only meaningful for the connection it was registered on.
+struct Live {
     connection: AudioPlaybackConnection,
     state_token: i64,
-    /// Whether `Start()` has been called. Held for the object's lifetime once
-    /// set, so the PC never stops advertising as a sink.
-    started: bool,
+}
+
+pub struct Sink {
+    /// `None` once closed. **Closing is discarding** - see the lifecycle rules
+    /// on [`Sink::close`] - so the next open constructs a fresh object.
+    live: Option<Live>,
     device: SinkDevice,
 }
 
 impl Sink {
-    /// Construct against a specific device id.
+    /// Bind to a specific device. Does not advertise anything yet.
     ///
     /// # Safety
     ///
     /// Caller must be on a COM-initialized thread.
     pub unsafe fn connect(device: SinkDevice) -> Result<Self> {
-        let connection = AudioPlaybackConnection::TryCreateFromId(&device.id.as_str().into())
-            .with_context(|| format!("TryCreateFromId failed for {}", device.name))?;
+        let mut sink = Self { live: None, device };
+        sink.ensure_live()
+            .map_err(|e| anyhow::anyhow!("could not construct a connection: {e}"))?;
+        Ok(sink)
+    }
+
+    /// Bind to the first paired device, if any.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be on a COM-initialized thread.
+    pub unsafe fn connect_first() -> Result<Self> {
+        let devices = unsafe { list_devices() }?;
+        let Some(device) = devices.into_iter().next() else {
+            bail!(
+                "no A2DP source devices found. Pair a phone with this PC first;                  the selector only matches already-paired devices."
+            );
+        };
+        unsafe { Sink::connect(device) }
+    }
+
+    pub fn device(&self) -> &SinkDevice {
+        &self.device
+    }
+
+    /// Construct and start a connection if we do not hold one.
+    ///
+    /// `Start()` is called exactly once per connection object, immediately, so
+    /// the PC advertises for as long as the object lives. It is never called on
+    /// a closed object - that is the access violation described on
+    /// [`Sink::close`].
+    fn ensure_live(&mut self) -> Result<(), SinkError> {
+        if self.live.is_some() {
+            return Ok(());
+        }
+
+        let connection = AudioPlaybackConnection::TryCreateFromId(&self.device.id.as_str().into())
+            .map_err(|e| SinkError::Other(format!("TryCreateFromId failed: {e}")))?;
 
         // Link-state transitions are logged, never used alone to decide health
         // - the premise of this project is that this signal can read `Opened`
@@ -123,56 +166,31 @@ impl Sink {
                 }
                 Ok(())
             }))
-            .context("StateChanged registration failed")?;
+            .map_err(|e| SinkError::Other(format!("StateChanged registration failed: {e}")))?;
 
-        Ok(Self {
-            connection,
-            state_token,
-            started: false,
-            device,
-        })
-    }
-
-    /// Construct against the first paired device, if any.
-    ///
-    /// # Safety
-    ///
-    /// Caller must be on a COM-initialized thread.
-    pub unsafe fn connect_first() -> Result<Self> {
-        let devices = unsafe { list_devices() }?;
-        let Some(device) = devices.into_iter().next() else {
-            bail!(
-                "no A2DP source devices found. Pair a phone with this PC first; \
-                 the selector only matches already-paired devices."
-            );
-        };
-        unsafe { Sink::connect(device) }
-    }
-
-    pub fn device(&self) -> &SinkDevice {
-        &self.device
-    }
-
-    /// Advertise this PC as an available sink. Idempotent.
-    ///
-    /// Held for the object's lifetime - see the module docs.
-    fn ensure_started(&mut self) -> Result<(), SinkError> {
-        if self.started {
-            return Ok(());
-        }
-        self.connection
+        connection
             .Start()
             .map_err(|e| SinkError::Other(format!("Start failed: {e}")))?;
-        self.started = true;
+
+        self.live = Some(Live {
+            connection,
+            state_token,
+        });
         Ok(())
     }
 }
 
 impl SinkConnection for Sink {
     fn open(&mut self) -> Result<(), SinkError> {
-        self.ensure_started()?;
+        // Reconstructs if we were closed. Repeated opens on a LIVE connection
+        // are fine and cheap - measured over many arms - so a benign re-arm
+        // costs nothing here.
+        self.ensure_live()?;
+        let Some(live) = &self.live else {
+            return Err(SinkError::DeviceUnavailable);
+        };
 
-        let result = self
+        let result = live
             .connection
             .Open()
             .map_err(|e| SinkError::Other(format!("Open dispatch failed: {e}")))?;
@@ -181,9 +199,9 @@ impl SinkConnection for Sink {
             .map_err(|e| SinkError::Other(format!("Open result had no status: {e}")))?;
 
         // One named mapping per status, rather than an `is_ok()` at the call
-        // site. Both of the interesting values here are non-fatal in different
-        // ways, and conflating them is how a phone in another room starts
-        // looking like a hardware fault.
+        // site. Several of these are non-fatal in different ways, and
+        // conflating them is how a phone in another room starts looking like a
+        // hardware fault.
         if status == AudioPlaybackConnectionOpenResultStatus::Success {
             // Dispatch succeeded. The link is NOT open yet - the caller waits
             // for link_state() to reach Opened.
@@ -200,13 +218,37 @@ impl SinkConnection for Sink {
         }
     }
 
+    /// Close **and discard** the connection.
+    ///
+    /// Closing is terminal for an `AudioPlaybackConnection`, which the WinRT
+    /// docs do not say and which cost an access violation to learn. Measured
+    /// 2026-09-14:
+    ///
+    /// | sequence | result |
+    /// |---|---|
+    /// | repeated `Open()`, no close between | works |
+    /// | `Close()`, discard, reconstruct, `Open()` | works |
+    /// | `Close()` then `Open()` on the same object | `DeniedBySystem`, forever |
+    /// | `Close()` on a never-started object, then `Start()` | **access violation** |
+    ///
+    /// So the object is dropped here and [`Sink::open`] builds a fresh one.
+    /// That is also exactly what CLAUDE.md's `recover()` describes: drop the
+    /// connection, release the interfaces, re-run the lifecycle.
     fn close(&mut self) {
-        // Explicit rather than relying on Drop, per CLAUDE.md.
-        let _ = self.connection.Close();
+        let Some(live) = self.live.take() else {
+            // Never constructed, or already closed. Doing anything here is how
+            // the access violation in the table above happens.
+            return;
+        };
+        let _ = live.connection.Close();
+        let _ = live.connection.RemoveStateChanged(live.state_token);
     }
 
     fn link_state(&self) -> LinkState {
-        match self.connection.State() {
+        let Some(live) = &self.live else {
+            return LinkState::Closed;
+        };
+        match live.connection.State() {
             Ok(s) if s == AudioPlaybackConnectionState::Opened => LinkState::Opened,
             // Closed, an unknown variant, or an error all mean "not usable".
             // Reporting Opened on an error would be the one genuinely
@@ -218,8 +260,7 @@ impl SinkConnection for Sink {
 
 impl Drop for Sink {
     fn drop(&mut self) {
-        let _ = self.connection.Close();
-        let _ = self.connection.RemoveStateChanged(self.state_token);
+        self.close();
     }
 }
 

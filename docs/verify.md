@@ -583,3 +583,62 @@ fault forever in silence.
   advertising throughout via the held `Start()`, so the worst case for noticing
   a returning phone is about a second - but it is the number to revisit if
   radio churn ever becomes a concern.
+
+---
+
+## RESOLVED: `AudioPlaybackConnection` lifecycle - closing is DISCARDING
+
+Found by an access violation on the first real `--run`, then pinned down with a
+throwaway spike. None of this is in the WinRT docs.
+
+| sequence | result |
+|---|---|
+| repeated `Open()`, no close between | **works** |
+| `Close()`, drop, reconstruct, `Open()` | **works** |
+| `Close()` then `Open()` on the same object | `DeniedBySystem`, permanently |
+| `Close()` on a **never-started** object, then `Start()` | **ACCESS VIOLATION** |
+
+So a connection object is single-use with respect to closing. Once closed it
+cannot be revived, and calling `Close()` on one that was never `Start()`ed
+corrupts it badly enough that the next `Start()` crashes the process.
+
+`platform::sink::Sink` now holds `Option<Live>`: `close()` drops the object
+outright and is a no-op when there is nothing live, and `open()` reconstructs
+via `TryCreateFromId` + `Start()` when needed. That is also exactly what
+CLAUDE.md's `recover()` always described - "drop the connection, release COM
+interfaces, re-run the lifecycle" - which the first implementation had quietly
+weakened into "close and reuse".
+
+### Consequence: only a recovery should tear down
+
+Because closing is expensive and irreversible, the supervisor no longer closes
+unconditionally before every open:
+
+- **Benign re-arm** - just `Open()` again on the live connection. Measurably
+  fine: the `--rearm` spike ran many arms this way without a single close, and
+  the link is reopened dozens of times in ordinary use.
+- **Genuine recovery** - close, discard, reconstruct. The heavy hammer, for
+  when the link is actually wedged.
+- **`DefaultDeviceChanged`** - also tears down, because the render target is
+  bound when the connection opens and does not follow the system default.
+
+This is the re-arm/recovery split earning its keep a second time, on a
+dimension it was not designed for.
+
+## First successful `--run` on real hardware
+
+```
+[   0.0s] Disconnected
+[   0.9s] meter scope: A2DP session (trustworthy)
+[   1.0s] Connected, silent (degraded - no AVRCP signal)
+[   1.5s] Streaming
+[  22.7s] Connected, silent (degraded - no AVRCP signal)
+[  24.7s] Streaming
+run complete, 0 recovery event(s) logged
+```
+
+Session attribution resolved in 0.9s, link up at 1.0s, audio at 1.5s. The
+22.7s entry is a real gap in the source audio, correctly reported as
+`Connected, silent` with **zero** recovery events - the conservative default
+declining to reconnect on silence alone, which is the behaviour the pause
+measurements demanded.
