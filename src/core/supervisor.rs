@@ -170,18 +170,29 @@ where
 
         // Closing is DISCARDING - on real hardware an AudioPlaybackConnection
         // cannot be reopened after a close, and reusing one returns
-        // DeniedBySystem forever. So tear down only when tearing down is the
-        // point:
+        // DeniedBySystem forever. So the question is when a teardown is worth
+        // its cost, and the answer is: whenever the link is suspect.
         //
-        // - a genuine recovery, which is what CLAUDE.md's recover() describes:
-        //   drop the connection, release the interfaces, re-run the lifecycle.
-        // - a default-device change, because the render target is bound when
-        //   the connection opens and does not follow the system default.
+        // - `LinkClosed` is the routine case. The link drops constantly in
+        //   ordinary use and reopening in place is measurably fine - the
+        //   --rearm spike ran many arms that way without a single close.
+        // - Everything else means the world changed underneath us, or the user
+        //   is telling us something is wrong. A live-looking connection is
+        //   exactly what is not to be trusted then.
         //
-        // A benign re-arm just reopens the live connection, which is measurably
-        // fine and far cheaper - the --rearm spike did exactly that across many
-        // arms without a single close.
-        if matches!(action, Action::Recover(_)) || device_changed {
+        // Manual is the one that matters most. Observed 2026-09-15: a wedged
+        // link reports `Opened` with its render session `Active` and a peak of
+        // zero - indistinguishable from a pause, so the watchdog cannot act,
+        // which makes the Reconnect button the only remedy. It reopened the
+        // dead connection in place and did nothing at all. A button that is
+        // the designated fix for a state has to actually be able to fix it.
+        let tears_down = match action {
+            Action::Recover(_) => true,
+            Action::ReArm(ReArmReason::Trigger(_)) => true,
+            Action::ReArm(ReArmReason::LinkClosed) => false,
+            Action::None => false,
+        };
+        if tears_down {
             self.sink.close();
         }
         match self.sink.open() {
@@ -441,6 +452,65 @@ mod tests {
             s.tick();
         }
         assert_eq!(s.meter().rebinds(), 0);
+    }
+
+    #[test]
+    fn a_manual_reconnect_tears_the_connection_down() {
+        // THE bug this guards. A wedged link reports Opened with its session
+        // Active and a zero peak - identical to a pause, so the watchdog is
+        // correctly silent and the button is the only remedy. Reopening in
+        // place does nothing to a dead connection; it has to be discarded and
+        // rebuilt.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::already_open(),
+            FakeMeter::silent(),
+            FakeRemote::unavailable(),
+        );
+
+        clock.advance_secs(1);
+        s.tick();
+        s.note_trigger(Trigger::Manual);
+        clock.advance_secs(2);
+        assert!(matches!(s.tick(), Tick::Dispatched(Action::ReArm(_))));
+        assert_eq!(
+            s.sink().close_calls(),
+            1,
+            "Reconnect must discard the connection, not reopen a dead one"
+        );
+    }
+
+    #[test]
+    fn every_external_trigger_tears_down() {
+        // A trigger means the world changed underneath us - resume, the radio
+        // cycling, the device list moving. A connection that still looks live
+        // is exactly what cannot be trusted at that point.
+        for trigger in [
+            Trigger::Manual,
+            Trigger::Resume,
+            Trigger::RadioToggled,
+            Trigger::DeviceChanged,
+            Trigger::DefaultDeviceChanged,
+        ] {
+            let clock = FakeClock::new();
+            let mut s = sup(
+                &clock,
+                FakeConnection::already_open(),
+                FakeMeter::with_peak(0.4),
+                FakeRemote::playing(),
+            );
+            clock.advance_secs(1);
+            s.tick();
+            s.note_trigger(trigger);
+            clock.advance_secs(2);
+            s.tick();
+            assert_eq!(
+                s.sink().close_calls(),
+                1,
+                "{trigger:?} should tear the connection down"
+            );
+        }
     }
 
     #[test]

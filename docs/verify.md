@@ -736,3 +736,68 @@ handled completely by the `LinkClosed` re-arm path.
 
 - **Resume from sleep.** Needs the PC actually slept; soak matrix item 2.
 - **`RadioToggled` with `RequestAccessAsync`** in place.
+
+---
+
+## RESOLVED: what a real fault looks like — and it is NOT distinguishable
+
+Observed 2026-09-15, in ordinary use, with the phone playing and routed to the
+PC. The user reported no audio, and Reconnect not helping. State at the time:
+
+| signal | value |
+|---|---|
+| `AudioPlaybackConnection::State()` | **`Opened`** |
+| A2DP render session (svchost 4312) | **present, `Active`** |
+| its peak over a 6s window | **`0.000000`** |
+| default render endpoint | `Headphones (A50 X Game)` — correct |
+| GSMTC | one session, a local browser. Nothing from the phone. |
+
+This is the bug the project exists to fix, caught in the wild for the first
+time: the link reports itself healthy, the render session is alive, and not one
+sample arrives.
+
+### The `Inactive` discriminator is dead
+
+The single remaining hope for automatic detection was the hypothesis recorded
+above: that a dead path would flip the session to `Inactive`, giving a signature
+that a pause (measured as `Active`) could not produce. **It does not.** A real
+fault presents as `Active` with a zero peak - byte for byte what a pause looks
+like.
+
+So with Signal B unavailable on this hardware, the app **cannot** tell a fault
+from a pause by any observation available to it. That is now measured rather
+than assumed, and it is final unless a new signal appears.
+
+Consequences, all of which the design already anticipated but which are now
+load-bearing rather than precautionary:
+
+- `recover_without_remote_signal` staying off by default is correct. Auto-
+  recovery on silence would fire on every pause.
+- **The Reconnect button is not a convenience. It is the only remedy**, and the
+  UI must keep it prominent and always enabled.
+- The peak meter is the only way the user learns they are in this state, which
+  is why it is the headline element.
+
+### And Reconnect could not fix it
+
+Worse: the button that is the only remedy did not work. `Trigger::Manual`
+produced `Action::ReArm`, and re-arms had been made to reopen in place rather
+than tear down - a deliberate optimisation after learning that `Close()` is
+terminal, correct for the routine `LinkClosed` case and wrong for everything
+else. Reopening a wedged connection does nothing.
+
+Fixed: `LinkClosed` still reopens in place, and **every external trigger now
+tears down and rebuilds**. A trigger means the world changed underneath us, or
+the user is telling us something is wrong; a connection that still looks live
+is precisely what cannot be trusted at that point.
+
+Confirmed by restarting the app, which does the same teardown: the session peak
+went from `0.000000` to `1.045455` and the audio returned.
+
+### Still unexplained
+
+What wedged the path in the first place. The app had been running for some time
+with the link open; nothing in the log marks a transition, because
+`StateChanged` is logged at `debug` and the default filter is `info`. That is an
+observability gap worth closing before the soak - if this happens overnight, the
+log as it stands will not say when or why.
