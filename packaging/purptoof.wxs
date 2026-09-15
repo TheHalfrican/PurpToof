@@ -37,6 +37,19 @@
     <MediaTemplate EmbedCab="yes" />
 
     <!--
+      A wizard, so double-clicking the MSI visibly does something.
+      Without a UI table Windows Installer runs it in basic-UI mode: a brief
+      progress window, then nothing - which is indistinguishable from the
+      installer crashing, and was reported as exactly that.
+
+      WixUI_Minimal rather than InstallDir: the install location is fixed
+      (%LOCALAPPDATA%\Programs), so a folder picker would offer a choice that
+      is not really on offer.
+    -->
+    <ui:WixUI xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui" Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="dist\license.rtf" />
+
+    <!--
       Stop a running instance. Windows Installer cannot replace a locked file,
       and without this an upgrade over a running tray app either prompts for a
       reboot or silently keeps the old binary.
@@ -57,7 +70,7 @@
       files.
     -->
     <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
-    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- ARPNOMODIFY comes from WixUI_Minimal; declaring it here too is a duplicate. -->
     <Property Id="ARPNOREPAIR" Value="1" />
 
     <StandardDirectory Id="LocalAppDataFolder">
