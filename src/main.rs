@@ -1,10 +1,11 @@
 //! PurpToof - a Windows A2DP sink that notices when its own audio path has
 //! died and restarts it.
 //!
-//! Still a skeleton. The tray-resident egui app grows here at milestone 8;
-//! for now the binary exists to host `--debug-sessions`.
+//! Thin by design: argument dispatch, and the decision of which thread gets
+//! which COM apartment. Everything else lives in the library.
 
 use anyhow::{Context, Result};
+use purptoof::core::Config;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
 // The pure logic lives in the library half of this crate (src/lib.rs).
@@ -13,14 +14,19 @@ mod debug_sessions;
 mod run;
 
 fn main() -> Result<()> {
-    // WinRT activation and the WASAPI interfaces both need an initialized
-    // apartment. MTA is correct while there is no message pump; this moves
-    // when the egui event loop arrives.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .context("CoInitializeEx failed")?;
-
+    // NOTE: COM is deliberately NOT initialized here.
+    //
+    // winit calls `OleInitialize`, which requires an STA. Initializing this
+    // thread as MTA makes that fail with RPC_E_CHANGED_MODE and panics before
+    // a window ever appears. The diagnostics below need an MTA on the calling
+    // thread, so they ask for one individually; the GUI path leaves this
+    // thread alone and lets `Worker` build its own MTA on the supervisor
+    // thread, where the apartment-bound COM objects actually live.
+    //
+    // This is the whole reason the supervisor moved to its own thread before
+    // the UI existed.
     if std::env::args().any(|a| a == "--debug-sessions") {
+        init_mta()?;
         return debug_sessions::run();
     }
 
@@ -31,25 +37,74 @@ fn main() -> Result<()> {
     // the same moment, which is how the first hardware run produced a window
     // of zeroes.
     if let Some(secs) = watch_secs(std::env::args()) {
+        init_mta()?;
         return debug_sessions::watch(secs);
     }
 
-    // The real app, headless. Unlike the two above this is NOT read-only: it
+    // Headless supervisor. Unlike the two above this is NOT read-only: it
     // advertises the PC as a sink and routes phone audio to the default
-    // output, so it is opt-in and bounded.
+    // output, so it is opt-in and bounded. No COM on this thread - `Worker`
+    // builds its own apartment on the supervisor thread.
     if let Some(secs) = run_secs(std::env::args()) {
         return run::run(secs);
     }
 
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return Ok(());
+    }
+
+    // No flags: the actual app.
+    gui()
+}
+
+/// Join the multithreaded apartment on *this* thread.
+///
+/// Only for the console diagnostics, which do their COM work inline. The GUI
+/// must never call this - see the note in `main`.
+fn init_mta() -> Result<()> {
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .context("CoInitializeEx failed")
+}
+
+/// Launch the window.
+///
+/// eframe owns this thread and wants its own event loop, so the supervisor is
+/// NOT started here - `PurpToofApp` spawns it onto its own MTA thread. The COM
+/// objects are apartment-bound to that thread and must never be touched from
+/// this one.
+fn gui() -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 560.0])
+            .with_min_inner_size([360.0, 420.0])
+            .with_icon(std::sync::Arc::new(purptoof::ui::icon_data()))
+            .with_title("PurpToof"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "PurpToof",
+        options,
+        Box::new(|cc| {
+            Ok(Box::new(purptoof::ui::PurpToofApp::new(
+                cc,
+                Config::default(),
+            )))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("could not start the window: {e}"))
+}
+
+fn print_usage() {
     println!("purptoof {}", env!("CARGO_PKG_VERSION"));
     println!();
+    println!("  (no flags)         the app");
     println!("  --debug-sessions   dump WASAPI sessions and GSMTC state (read-only)");
     println!("  --watch[=SECS]     the same, sampled once a second (default 120)");
-    println!("  --run[=SECS]       the real supervisor, headless (default 300).");
+    println!("  --run[=SECS]       the supervisor, headless, no window (default 300).");
     println!("                     ROUTES PHONE AUDIO to the default output.");
-    println!();
-    println!("The tray app is not built yet. See CLAUDE.md for the order of work.");
-    Ok(())
 }
 
 /// Seconds `--run` should run for, or `None` if the flag is absent.

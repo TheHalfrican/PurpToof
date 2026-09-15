@@ -257,7 +257,11 @@ fn worker_main(
     let built = (|| -> Result<(Sink, WasapiMeter, GsmtcRemote)> {
         let sink = unsafe { Sink::connect_first() }.context("could not construct the sink")?;
         let meter = unsafe { WasapiMeter::new() }.context("could not build the meter")?;
-        let remote = unsafe { GsmtcRemote::new() }.context("could not reach GSMTC")?;
+        // The device name is what lets Signal B tell the phone's session from a
+        // media player running on this PC. Without it, a browser reporting
+        // Playing drives the watchdog.
+        let remote =
+            unsafe { GsmtcRemote::new(&sink.device().name) }.context("could not reach GSMTC")?;
         Ok((sink, meter, remote))
     })();
 

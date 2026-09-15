@@ -3,9 +3,20 @@ name = "purptoof"
 version = "0.1.0"
 edition = "2024"
 description = "Windows Bluetooth A2DP audio receiver that recovers itself when the audio path dies"
+# spike-a2dp is a diagnostic that opens a real stream; it must never be what a
+# bare `cargo run` launches.
+default-run = "purptoof"
 
 [dependencies]
 anyhow = "1.0.104"
+# The window. default-features off because the defaults pull in accesskit and
+# persistence, neither of which a single-view tray app needs; wayland/x11 are
+# omitted because this crate binds WinRT and does not build anywhere but
+# Windows anyway.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 # The facade only, for now. It is a no-op without a subscriber, so platform/

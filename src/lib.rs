@@ -11,7 +11,8 @@
 //!   meaningful instead of needing a blanket `allow`.
 //! - [`platform`] implements [`core::traits`] against WinRT, COM and Win32,
 //!   and is kept too thin to be wrong in an interesting way.
-//! - `ui/` (milestone 8) is egui, and also thin.
+//! - [`ui`] is egui, and also thin: it reads a snapshot and draws it.
 
 pub mod core;
 pub mod platform;
+pub mod ui;
