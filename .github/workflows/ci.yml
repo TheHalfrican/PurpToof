@@ -85,11 +85,12 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+      # Idempotent, and works on both runners. A plain `choco install` broke the
+      # self-hosted one, which has winget rather than chocolatey and already had
+      # both tools - so it failed while having nothing to do.
       - name: Install packaging tools
         shell: pwsh
-        run: |
-          choco install nsis --no-progress -y
-          dotnet tool install --global wix --version 5.0.2
+        run: ./scripts/ensure-packaging-tools.ps1
 
       - name: Build installers
         shell: pwsh

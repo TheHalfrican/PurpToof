@@ -16,7 +16,10 @@ fn main() {
 
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/purptoof.ico")
-        .set("FileDescription", "Bluetooth audio receiver that recovers itself")
+        .set(
+            "FileDescription",
+            "Bluetooth audio receiver that recovers itself",
+        )
         .set("ProductName", "PurpToof")
         .set("CompanyName", "TheHalfrican")
         .set("LegalCopyright", "MIT licensed");
