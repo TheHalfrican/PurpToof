@@ -1,6 +1,6 @@
 [package]
 name = "purptoof"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Windows Bluetooth A2DP audio receiver that recovers itself when the audio path dies"
 # spike-a2dp is a diagnostic that opens a real stream; it must never be what a

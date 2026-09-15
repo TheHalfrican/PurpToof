@@ -22,7 +22,7 @@ Unicode true
 ; version out of Cargo.toml rather than this file carrying a second copy that
 ; drifts.
 !ifndef VERSION
-  !define VERSION "0.1.0"
+  !define VERSION "0.2.0"
 !endif
 !define EXE        "purptoof.exe"
 !define REGKEY     "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"

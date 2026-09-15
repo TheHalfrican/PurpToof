@@ -3,9 +3,9 @@
 Resume point for a new session. `CLAUDE.md` is the design; this file is the
 state. If they disagree, this file is newer.
 
-**Last updated:** 2026-09-14
+**Last updated:** 2026-09-15, v0.2.0
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
-**Tests:** 124 passing, ~0.2s, core still all on a fake clock
+**Tests:** 126 passing, ~0.2s, core still all on a fake clock
 **Ratio gate:** passing on `src/core/` against a 0.9 floor
 
 ---
@@ -125,11 +125,19 @@ path produces a link that drops on idle) and leave it. In the morning:
 Record the result in `docs/soak.md` with the date and build hash, against the
 matrix in CLAUDE.md.
 
-**The specific question the soak answers**, which nothing else can: what a real
-fault looks like. Every other premise in the health model has been measured;
-"a dead audio path presents as `Inactive`" has not, because it cannot be
-produced on demand. The supervisor logs session state alongside the peak, so if
-it happens overnight the answer is in the file.
+**A real fault has now been seen** (2026-09-15, `docs/verify.md`), and it
+settled the last open question in the health model: a dead path presents as link
+`Opened`, session `Active`, peak zero - **identical to a pause**. There is no
+signal left that distinguishes them, so auto-recovery on silence stays off and
+the Reconnect button is the only remedy.
+
+**Close this observability gap before the soak.** Nothing in the log marked that
+fault: `StateChanged` is logged at `debug` and the default filter is `info`, so
+the link transitions that would say *when* and *why* are discarded. As it
+stands, an overnight fault will leave a log that shows startup lines and nothing
+else - which is exactly what happened when this one occurred. Promote the link
+transition to `info`, and log each re-arm and its reason, before leaving it
+running overnight.
 
 Also still untested: **resume from sleep**. Soak matrix item 2 - sleep the PC
 five minutes, confirm audio returns with no interaction.
