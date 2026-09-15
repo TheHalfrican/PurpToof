@@ -112,11 +112,16 @@ fn rearm_loop(connection: &AudioPlaybackConnection, total_secs: u32) -> Result<(
         let waited = attempt_at.elapsed();
 
         if status != AudioPlaybackConnectionOpenResultStatus::Success {
+            // The extended error is the only thing that distinguishes one
+            // UnknownFailure from another, and "no phone reachable" arrives as
+            // UnknownFailure rather than RequestTimedOut - so this HRESULT is
+            // what a non-escalating mapping has to key on.
             println!(
-                "[{}] arm #{arm}: {} after {:.1}s - rearming",
+                "[{}] arm #{arm}: {} after {:.1}s (extended {:?}) - rearming",
                 stamp(&run_start),
                 open_status_name(status),
-                waited.as_secs_f32()
+                waited.as_secs_f32(),
+                result.ExtendedError()
             );
             std::thread::sleep(REARM_FLOOR);
             continue;

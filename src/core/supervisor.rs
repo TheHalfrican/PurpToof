@@ -14,11 +14,19 @@
 //! which is precisely the case `OpenBehavior::SucceedWithoutTransition` exists
 //! to reproduce.
 //!
-//! # Why `TimedOut` is not a failure
+//! # Why "no remote" is not a failure
 //!
-//! With the sink permanently armed, `Open()` returns `RequestTimedOut` for as
-//! long as the phone is out of range. That is the steady state, not a fault, so
-//! it resolves as [`RecoveryOutcome::NoRemote`] and never touches the ladder.
+//! With the sink permanently armed, `Open()` keeps failing for as long as the
+//! phone is out of range. That is the steady state, not a fault, so it resolves
+//! as [`RecoveryOutcome::NoRemote`] and never touches the ladder.
+//!
+//! What that failure actually looks like was measured on 2026-09-14 with the
+//! phone's Bluetooth switched off, and it is **not** `RequestTimedOut` as the
+//! design assumed. It is `UnknownFailure` carrying `0x8007001F`, which
+//! `platform/` maps to [`SinkError::Unreachable`]. Before that mapping existed
+//! it fell into `SinkError::Other` and escalated, ratcheting the backoff ladder
+//! against a phone that was simply switched off. Both spellings are handled
+//! here; they stay distinct only so the log can say which occurred.
 
 use std::time::Instant;
 
@@ -147,7 +155,11 @@ where
         self.sink.close();
         match self.sink.open() {
             Ok(()) => self.awaiting_open = Some(self.clock.now()),
-            Err(SinkError::TimedOut) => {
+            // Both mean "no remote", and neither is a fault. They are kept
+            // distinct only so the log can say which actually happened - on
+            // real hardware a powered-off phone produces Unreachable, and
+            // RequestTimedOut has never yet been observed at all.
+            Err(SinkError::TimedOut | SinkError::Unreachable) => {
                 self.monitor.recovery_finished(RecoveryOutcome::NoRemote);
             }
             Err(_) => {
@@ -296,6 +308,56 @@ mod tests {
             HealthStatus::Listening,
             "advertising into an empty room is Listening, not Disconnected"
         );
+    }
+
+    #[test]
+    fn a_powered_off_phone_resolves_as_no_remote_and_never_escalates() {
+        // The measured shape of "phone Bluetooth is off": not RequestTimedOut,
+        // which the design originally assumed, but UnknownFailure carrying
+        // 0x8007001F, which platform/ maps to Unreachable. Before this was
+        // mapped it landed in SinkError::Other and escalated - so this test is
+        // guarding a bug that actually existed.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::scripted(vec![OpenBehavior::Fail(SinkError::Unreachable)]),
+            FakeMeter::silent(),
+            FakeRemote::unavailable(),
+        );
+
+        for _ in 0..200 {
+            clock.advance_secs(2);
+            match s.tick() {
+                Tick::Dispatched(Action::ReArm(_)) | Tick::Idle => {}
+                other => panic!("a powered-off phone must stay benign, got {other:?}"),
+            }
+        }
+
+        assert_eq!(s.status(), HealthStatus::Listening);
+    }
+
+    #[test]
+    fn a_genuine_open_failure_still_escalates() {
+        // The other half of the same mapping: something that is NOT "come back
+        // later" must still reach the ladder, or a real fault retries forever
+        // in silence.
+        let clock = FakeClock::new();
+        let mut s = sup(
+            &clock,
+            FakeConnection::scripted(vec![OpenBehavior::Fail(SinkError::Other("denied".into()))]),
+            FakeMeter::silent(),
+            FakeRemote::unavailable(),
+        );
+
+        let mut escalated = false;
+        for _ in 0..50 {
+            clock.advance_secs(2);
+            if let Tick::Dispatched(Action::Recover(_)) = s.tick() {
+                escalated = true;
+                break;
+            }
+        }
+        assert!(escalated, "a real failure must eventually reach the ladder");
     }
 
     #[test]

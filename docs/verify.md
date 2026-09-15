@@ -525,3 +525,61 @@ change, device removal. Those remain the reason the re-arm path exists.
   session.
 - **Radio selective suspend.** The Intel adapter's power-management state has
   still never been read.
+
+---
+
+## RESOLVED: what `Open()` does when the phone is not reachable
+
+Measured 2026-09-14 with the iPhone's Bluetooth switched off, via
+`spike-a2dp --rearm`. Two answers, and the second one was a live bug.
+
+**1. `Open()` does not block for long.** 25 consecutive attempts returned in
+**0.8s to 4.9s**, typically ~1s. The concern that a synchronous `Open()` would
+stall the tick loop or freeze a UI for a long timeout does not materialise. The
+synchronous call is fine; `OpenAsync` is not needed, and the supervisor's
+existing awaiting-phase already covers the asynchronous part that does exist
+(the `Opened` transition).
+
+**2. "No remote" does NOT arrive as `RequestTimedOut`.**
+
+```
+[t+  1.4s] arm #1: UnknownFailure after 1.4s (extended Ok(HRESULT(0x8007001F)))
+[t+  2.7s] arm #2: UnknownFailure after 1.1s (extended Ok(HRESULT(0x8007001F)))
+[t+  3.9s] arm #3: UnknownFailure after 1.0s (extended Ok(HRESULT(0x8007001F)))
+```
+
+`0x8007001F` is `HRESULT_FROM_WIN32(ERROR_GEN_FAILURE)` - "a device attached to
+the system is not functioning." Identical on every single attempt.
+`RequestTimedOut` was never observed at all.
+
+This mattered immediately. `RecoveryOutcome::NoRemote` - the whole mechanism
+for *not* escalating when the phone is simply elsewhere - keyed on
+`SinkError::TimedOut`. An `UnknownFailure` fell through to `SinkError::Other`
+and was treated as a genuine failure, which would escalate past the re-arm
+threshold, ratchet the backoff ladder to its 60s cap, and leave the app
+sluggish when the phone came back. Exactly the bug `NoRemote` was written to
+prevent, reintroduced through the error mapping.
+
+Fixed by `platform::sink::classify_unknown_failure`, which reads the extended
+error and returns `SinkError::Unreachable` for `0x8007001F` and
+`SinkError::Other` for anything else. `Unreachable` and `TimedOut` are kept as
+separate variants so the reconnect log can say which actually happened, but the
+supervisor treats both as `NoRemote`.
+
+**Do not collapse `UnknownFailure` to a single meaning.** One value of it means
+"come back later" and every other value may not; a mapping that cannot tell
+them apart either escalates against a switched-off phone or retries a real
+fault forever in silence.
+
+### Also observed
+
+- **The device still enumerates with the phone's radio off.** The selector's
+  `System.Devices.InterfaceEnabled` stayed true, and `TryCreateFromId`
+  succeeded. So the `DeviceChanged` re-arm trigger will not fire merely because
+  the phone was switched off, and an absent phone is distinguishable from an
+  unpaired one.
+- **Re-arm cadence while unreachable** settles at roughly one attempt per
+  1-2s: the 250ms floor plus the ~1s call. Acceptable - the PC keeps
+  advertising throughout via the held `Start()`, so the worst case for noticing
+  a returning phone is about a second - but it is the number to revisit if
+  radio churn ever becomes a concern.

@@ -19,10 +19,13 @@
 //!    transition to `Opened` arrives asynchronously afterwards, and `State()`
 //!    still reads `Closed` in between. [`Sink::open`] therefore reports success
 //!    on dispatch only; the caller waits for [`Sink::link_state`].
-//! 2. `RequestTimedOut` is **not** a failure. With the phone out of range it is
-//!    the steady state and can persist for hours. It maps to
-//!    [`SinkError::TimedOut`], which the caller turns into
-//!    `RecoveryOutcome::NoRemote` rather than a failed re-arm.
+//! 2. **"No remote" is not a failure, and does not arrive as
+//!    `RequestTimedOut`.** With the phone switched off, `Open()` returns
+//!    `UnknownFailure` with extended error `0x8007001F` after 0.8-4.9s,
+//!    identically every time; `RequestTimedOut` has never been observed at
+//!    all. Both map to non-fatal errors that the caller turns into
+//!    `RecoveryOutcome::NoRemote` rather than a failed re-arm. See
+//!    [`classify_unknown_failure`].
 
 use anyhow::{Context, Result, bail};
 use windows::Devices::Enumeration::DeviceInformation;
@@ -65,6 +68,27 @@ pub unsafe fn list_devices() -> Result<Vec<SinkDevice>> {
         });
     }
     Ok(out)
+}
+
+/// `HRESULT_FROM_WIN32(ERROR_GEN_FAILURE)` - "a device attached to the system
+/// is not functioning."
+///
+/// What `Open()` reports, via the extended error, when the remote's radio is
+/// off or it is out of range. Measured 2026-09-14 with the phone's Bluetooth
+/// switched off: identical on every one of 25 consecutive attempts.
+const E_DEVICE_NOT_FUNCTIONING: i32 = 0x8007_001Fu32 as i32;
+
+/// Turn an `UnknownFailure` into something the state machine can act on.
+///
+/// Split out and tested because the distinction is load-bearing: one of these
+/// must not escalate and the other must. Inlining it at the call site is
+/// exactly the shape of mistake this layer is supposed to be too dumb to make.
+fn classify_unknown_failure(extended: Option<windows::core::HRESULT>) -> SinkError {
+    match extended {
+        Some(h) if h.0 == E_DEVICE_NOT_FUNCTIONING => SinkError::Unreachable,
+        Some(h) => SinkError::Other(format!("Open failed, extended error {:#010x}", h.0)),
+        None => SinkError::Other("Open failed with no extended error".into()),
+    }
 }
 
 pub struct Sink {
@@ -169,10 +193,10 @@ impl SinkConnection for Sink {
         } else if status == AudioPlaybackConnectionOpenResultStatus::DeniedBySystem {
             Err(SinkError::Denied)
         } else {
-            Err(SinkError::Other(format!(
-                "Open returned unknown status {}",
-                status.0
-            )))
+            // UnknownFailure is not one thing. The extended error is the only
+            // way to tell "the phone's radio is off" from a genuine fault, and
+            // getting this wrong makes an absent phone escalate.
+            Err(classify_unknown_failure(result.ExtendedError().ok()))
         }
     }
 
@@ -196,5 +220,46 @@ impl Drop for Sink {
     fn drop(&mut self) {
         let _ = self.connection.Close();
         let _ = self.connection.RemoveStateChanged(self.state_token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::HRESULT;
+
+    #[test]
+    fn a_powered_off_radio_is_unreachable_not_a_fault() {
+        // The measured signature. If this mapping regresses, an absent phone
+        // silently starts ratcheting the backoff ladder again.
+        assert_eq!(
+            classify_unknown_failure(Some(HRESULT(E_DEVICE_NOT_FUNCTIONING))),
+            SinkError::Unreachable
+        );
+    }
+
+    #[test]
+    fn any_other_extended_error_stays_a_real_failure() {
+        // E_ACCESSDENIED, picked because it is emphatically not "come back
+        // later" - treating it as Unreachable would retry forever in silence.
+        let other = classify_unknown_failure(Some(HRESULT(0x8007_0005u32 as i32)));
+        assert!(matches!(other, SinkError::Other(_)), "got {other:?}");
+    }
+
+    #[test]
+    fn a_missing_extended_error_stays_a_real_failure() {
+        let none = classify_unknown_failure(None);
+        assert!(matches!(none, SinkError::Other(_)), "got {none:?}");
+    }
+
+    #[test]
+    fn the_message_keeps_the_hresult_readable() {
+        // The log is the only place a novel failure gets diagnosed, so the
+        // code has to survive into it.
+        let SinkError::Other(msg) = classify_unknown_failure(Some(HRESULT(0x8007_0005u32 as i32)))
+        else {
+            panic!("expected Other");
+        };
+        assert!(msg.contains("0x80070005"), "unhelpful message: {msg}");
     }
 }

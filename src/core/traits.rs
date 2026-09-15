@@ -52,6 +52,21 @@ pub enum SinkError {
     Denied,
     /// The remote never showed up in time - `RequestTimedOut`.
     TimedOut,
+    /// The remote is not reachable: its radio is off, or it is out of range.
+    ///
+    /// Measured on 2026-09-14 with the phone's Bluetooth switched off. This
+    /// does **not** arrive as `RequestTimedOut`, which is what the design
+    /// originally assumed. It arrives as `UnknownFailure` with an extended
+    /// error of `0x8007001F` (`HRESULT_FROM_WIN32(ERROR_GEN_FAILURE)`),
+    /// identically on every attempt, after 0.8-4.9s.
+    ///
+    /// It is kept distinct from [`SinkError::TimedOut`] so the log can say
+    /// which actually happened, but both mean the same thing to the state
+    /// machine: no remote, so not a fault. Folding this into
+    /// [`SinkError::Other`] is what made an absent phone escalate and ratchet
+    /// the backoff ladder - the exact failure `RecoveryOutcome::NoRemote`
+    /// exists to prevent.
+    Unreachable,
     /// No such device, or it went away mid-open.
     DeviceUnavailable,
     /// Anything else, with the underlying detail preserved for the log.
@@ -63,6 +78,7 @@ impl std::fmt::Display for SinkError {
         match self {
             SinkError::Denied => write!(f, "denied by system"),
             SinkError::TimedOut => write!(f, "request timed out"),
+            SinkError::Unreachable => write!(f, "remote not reachable"),
             SinkError::DeviceUnavailable => write!(f, "device unavailable"),
             SinkError::Other(s) => write!(f, "{s}"),
         }
