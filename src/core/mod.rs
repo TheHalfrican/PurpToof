@@ -12,6 +12,7 @@
 pub mod backoff;
 pub mod config;
 pub mod health;
+pub mod supervisor;
 pub mod traits;
 pub mod types;
 
@@ -20,6 +21,7 @@ pub mod fakes;
 
 pub use config::Config;
 pub use health::HealthMonitor;
+pub use supervisor::{Supervisor, Tick};
 pub use traits::{AudioMeter, Clock, RemotePlayback, SinkConnection, SinkError, SystemClock};
 pub use types::{
     Action, HealthStatus, LinkState, Observation, PlaybackStatus, ReArmReason, RecoveryOutcome,

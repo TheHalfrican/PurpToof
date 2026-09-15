@@ -5,8 +5,8 @@ state. If they disagree, this file is newer.
 
 **Last updated:** 2026-09-14
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
-**Tests:** 67 passing, ~0.2s, all on a fake clock
-**Ratio gate:** 2.51:1 on `src/core/` against a 0.9 floor
+**Tests:** 85 passing, ~0.2s, all on a fake clock
+**Ratio gate:** 2.44:1 on `src/core/` against a 0.9 floor
 
 ---
 
@@ -19,8 +19,8 @@ state. If they disagree, this file is newer.
 | 3 | Bare connect + render, confirm audio flows | **done** — audio confirmed audible out of the PC on 2026-09-14 |
 | 4 | `--debug-sessions`, resolve both VERIFY items | **done — both VERIFY items resolved 2026-09-14** |
 | 5 | `core/` traits + `FakeConnection` + health state machine | **done** |
-| 6 | `platform/` impls behind the traits, `recover()` wired | **next** |
-| 7 | Re-arm triggers | not started |
+| 6 | `platform/` impls behind the traits, `recover()` wired | **done** — supervisor runs headless via `--run` |
+| 7 | Re-arm triggers | **next** |
 | 8 | egui UI + tray | not started |
 | 9 | Config loading, autostart, logging | `Config` type exists and is tested; no file I/O, no autostart, no `tracing` yet |
 | 10 | Overnight soak → `docs/soak.md` | not started |
@@ -104,34 +104,31 @@ raw tables are in `docs/verify.md`; these are the conclusions that change code.
    holding the sink had closed it. `platform/` must read state from the
    connection it owns.
 
-### Step 1 — milestone 6, `platform/`
+### Step 1 — milestone 7, re-arm triggers
 
-Implement the four traits in `src/core/traits.rs` against the real OS. The
-`--debug-sessions` COM code in `src/debug_sessions.rs` is where most of this
-already lives, unlayered — **move it into `platform/` behind `AudioMeter` and
-`RemotePlayback`** rather than writing it twice, and have `--debug-sessions`
-render through the traits.
+Milestone 6 is done. `core/supervisor.rs` holds the tick loop, generic over the
+four traits so it runs entirely on the fake clock in tests; `platform/` supplies
+the real implementations; `--run` drives it headless. The trigger plumbing only
+has to call `Supervisor::note_trigger`, which already debounces a burst into a
+single re-arm.
 
-Carry these forward, each learned the hard way:
+| Trigger | Mechanism |
+|---|---|
+| Resume from sleep | `RegisterSuspendResumeNotification`, `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` |
+| Bluetooth radio toggled | `Windows.Devices.Radios.Radio::StateChanged` |
+| Default render device changed | `IMMNotificationClient::OnDefaultDeviceChanged` |
+| Device appears / disappears | `DeviceWatcher` over the playback-connection selector |
 
-- **One named helper per HRESULT-returning call.** `IsSystemSoundsSession()`
-  returns a raw `HRESULT` where `S_OK` means yes and `S_FALSE` means *no* —
-  both success codes, so `.is_ok()` silently labelled all nine sessions as
-  system sounds. Inlining HRESULT checks at call sites is how `platform/`
-  stops being too dumb to be wrong.
-- **`open()` returning `Ok` does not mean the link is open.** Observed on real
-  hardware: `Open()` returned `Success` while `State()` still read `Closed`,
-  and `StateChanged -> Opened` arrived asynchronously afterwards. `recover()`
-  must wait for that transition under `Config::open_transition_timeout`
-  (default 5s) and report `RecoveryOutcome::Failed` if it never comes.
-  `FakeConnection`'s `OpenBehavior::SucceedWithoutTransition` models this.
-- **Use the synchronous `Start`/`Open`/`Close`.** Both forms exist; the sync
-  ones need no future and suit `recover()`'s sub-second target. Call `Close()`
-  explicitly rather than relying on `Drop`.
-- **Poll the meter at ~10 Hz** — that is the rate the fake tests assume and
-  what `--debug-sessions` samples at.
+Two of these need a message pump, which the MTA console process does not have.
+That is the real work here, and it interacts with milestone 8 - egui brings its
+own event loop, so decide where the pump lives before writing either.
 
-### Step 2 — milestone 7 onward
+**The default-device case also needs more than a trigger.** `WasapiMeter` binds
+to the endpoint at construction and does not follow a later default change, so
+the meter has to be rebuilt, not just the connection. Same for the session
+manager it hunts the A2DP session through.
+
+### Step 2 — milestone 8 onward
 
 Triggers, then UI, then config file I/O and logging, then soak. The trigger
 plumbing feeds `HealthMonitor::note_trigger`, which already debounces a burst
@@ -198,7 +195,7 @@ Beyond CLAUDE.md's sketch, in ways that matter:
 ## Commands
 
 ```bash
-cargo test                                  # 67 tests, ~0.2s
+cargo test                                  # 85 tests, ~0.2s
 cargo clippy --all-targets -- -D warnings   # what CI gates on
 cargo fmt --check
 pwsh -File scripts/check-test-ratio.ps1     # the 0.9:1 gate on core/
@@ -209,6 +206,7 @@ cargo run --bin spike-a2dp                     # read-only: enumerate + construc
 cargo run --bin spike-a2dp -- --start-only     # exercises the radio, moves no audio
 cargo run --bin spike-a2dp -- --open --hold=N  # OPENS A STREAM — routes phone audio
 cargo run --bin spike-a2dp -- --rearm --hold=N # always-armed sink; also opens a stream
+cargo run --bin purptoof -- --run=300           # THE REAL APP, headless. Routes phone audio.
 ```
 
 `cargo nextest run --no-tests=pass` is what CI runs; nextest is not installed

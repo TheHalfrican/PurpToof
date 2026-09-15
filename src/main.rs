@@ -10,6 +10,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 // The pure logic lives in the library half of this crate (src/lib.rs).
 
 mod debug_sessions;
+mod run;
 
 fn main() -> Result<()> {
     // WinRT activation and the WASAPI interfaces both need an initialized
@@ -33,27 +34,46 @@ fn main() -> Result<()> {
         return debug_sessions::watch(secs);
     }
 
+    // The real app, headless. Unlike the two above this is NOT read-only: it
+    // advertises the PC as a sink and routes phone audio to the default
+    // output, so it is opt-in and bounded.
+    if let Some(secs) = run_secs(std::env::args()) {
+        return run::run(secs);
+    }
+
     println!("purptoof {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("  --debug-sessions   dump WASAPI sessions and GSMTC state (read-only)");
     println!("  --watch[=SECS]     the same, sampled once a second (default 120)");
+    println!("  --run[=SECS]       the real supervisor, headless (default 300).");
+    println!("                     ROUTES PHONE AUDIO to the default output.");
     println!();
     println!("The tray app is not built yet. See CLAUDE.md for the order of work.");
     Ok(())
 }
 
+/// Seconds `--run` should run for, or `None` if the flag is absent.
+fn run_secs(args: impl Iterator<Item = String>) -> Option<u32> {
+    flag_secs(args, "--run", 300)
+}
+
 /// Seconds `--watch` should run for, or `None` if the flag is absent.
-///
-/// Accepts `--watch`, `--watch=SECS` and `--watch SECS`. A malformed value
-/// falls back to the default rather than aborting - this is a diagnostic run
-/// on real hardware, and refusing to start over a typo wastes the setup.
 fn watch_secs(args: impl Iterator<Item = String>) -> Option<u32> {
-    const DEFAULT: u32 = 120;
-    let mut rest = args.skip_while(|a| !a.starts_with("--watch"));
-    let flag = rest.next()?;
-    match flag.strip_prefix("--watch=") {
-        Some(v) => Some(v.parse().unwrap_or(DEFAULT)),
-        None => Some(rest.next().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT)),
+    flag_secs(args, "--watch", 120)
+}
+
+/// Seconds for a `--flag`, `--flag=SECS` or `--flag SECS` duration argument.
+///
+/// A malformed value falls back to the default rather than aborting. These are
+/// runs on real hardware with a phone in hand; refusing to start over a typo
+/// wastes the setup, and every one of them is time-bounded anyway.
+fn flag_secs(args: impl Iterator<Item = String>, flag: &str, default: u32) -> Option<u32> {
+    let eq = format!("{flag}=");
+    let mut rest = args.skip_while(|a| a != flag && !a.starts_with(&eq));
+    let found = rest.next()?;
+    match found.strip_prefix(&eq) {
+        Some(v) => Some(v.parse().unwrap_or(default)),
+        None => Some(rest.next().and_then(|v| v.parse().ok()).unwrap_or(default)),
     }
 }
 
@@ -80,6 +100,28 @@ mod tests {
     fn both_spellings_parse() {
         assert_eq!(secs(&["purptoof", "--watch=45"]), Some(45));
         assert_eq!(secs(&["purptoof", "--watch", "45"]), Some(45));
+    }
+
+    #[test]
+    fn the_two_duration_flags_do_not_match_each_other() {
+        // Both flags share one parser, so a prefix match would make --run=60
+        // silently start a watch. The distinct mode matters: one is read-only
+        // and one routes the phone audio.
+        assert_eq!(secs(&["purptoof", "--run=60"]), None);
+        assert_eq!(secs(&["purptoof", "--run", "60"]), None);
+        assert_eq!(
+            super::run_secs(["purptoof", "--watch=60"].iter().map(|s| s.to_string())),
+            None
+        );
+        assert_eq!(
+            super::run_secs(["purptoof", "--run=60"].iter().map(|s| s.to_string())),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn a_longer_flag_with_the_same_prefix_is_not_matched() {
+        assert_eq!(secs(&["purptoof", "--watchdog"]), None);
     }
 
     #[test]
