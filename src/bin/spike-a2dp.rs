@@ -59,6 +59,21 @@ fn open_status_name(s: AudioPlaybackConnectionOpenResultStatus) -> String {
     }
 }
 
+/// Seconds `--open` holds the stream up when `--hold` is not given.
+const DEFAULT_HOLD_SECS: u32 = 20;
+
+/// Parse `--hold=N` or `--hold N`. Returns `None` when the flag is absent or
+/// its value does not parse, and the caller falls back to the default - a
+/// malformed hold is not worth aborting a hardware run over.
+fn parse_hold(args: impl Iterator<Item = String>) -> Option<u32> {
+    let mut rest = args.skip_while(|a| !a.starts_with("--hold"));
+    let flag = rest.next()?;
+    match flag.strip_prefix("--hold=") {
+        Some(v) => v.parse().ok(),
+        None => rest.next()?.parse().ok(),
+    }
+}
+
 fn main() -> Result<()> {
     // WinRT activation needs an initialized apartment. MTA is correct for a
     // console process with no message pump.
@@ -75,6 +90,12 @@ fn main() -> Result<()> {
     // short of a full open.
     let start_only = std::env::args().any(|a| a == "--start-only");
     let open = std::env::args().any(|a| a == "--open");
+
+    // How long `--open` holds the stream up after a successful `Open()`. The
+    // default is enough to hear whether audio is flowing; a longer hold is for
+    // running `--debug-sessions` against a live stream from another terminal,
+    // which needs room for enumeration plus its own sampling window.
+    let hold_secs = parse_hold(std::env::args()).unwrap_or(DEFAULT_HOLD_SECS);
 
     println!("== stage 1: enumeration + construction (read-only) ==");
 
@@ -212,8 +233,8 @@ fn main() -> Result<()> {
             "\nVERDICT: unpackaged Win32 is sufficient. MSIX is OFF the table -\n\
              no package identity, no UWP lifecycle, no suspension risk."
         );
-        println!("\nholding 20s - play audio on the phone and listen.");
-        for i in 1..=20 {
+        println!("\nholding {hold_secs}s - play audio on the phone and listen.");
+        for i in 1..=hold_secs {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if i % 5 == 0 {
                 println!("  t+{i}s state: {}", state_name(connection.State()?));
@@ -232,4 +253,31 @@ fn main() -> Result<()> {
     connection.RemoveStateChanged(token).ok();
     println!("closed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hold(args: &[&str]) -> Option<u32> {
+        parse_hold(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn absent_flag_falls_through_to_the_default() {
+        assert_eq!(hold(&["spike-a2dp", "--open"]), None);
+    }
+
+    #[test]
+    fn both_spellings_parse() {
+        assert_eq!(hold(&["spike-a2dp", "--open", "--hold=90"]), Some(90));
+        assert_eq!(hold(&["spike-a2dp", "--open", "--hold", "90"]), Some(90));
+    }
+
+    #[test]
+    fn malformed_values_fall_through_rather_than_abort() {
+        assert_eq!(hold(&["spike-a2dp", "--hold=abc"]), None);
+        assert_eq!(hold(&["spike-a2dp", "--hold"]), None);
+        assert_eq!(hold(&["spike-a2dp", "--hold", "--open"]), None);
+    }
 }

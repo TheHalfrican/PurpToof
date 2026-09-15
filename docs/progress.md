@@ -3,9 +3,9 @@
 Resume point for a new session. `CLAUDE.md` is the design; this file is the
 state. If they disagree, this file is newer.
 
-**Last updated:** 2026-09-11, at commit `644c0bd`
+**Last updated:** 2026-09-14
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
-**Tests:** 57 passing, ~0.17s, all on a fake clock
+**Tests:** 67 passing, ~0.2s, all on a fake clock
 **Ratio gate:** 2.51:1 on `src/core/` against a 0.9 floor
 
 ---
@@ -16,8 +16,8 @@ state. If they disagree, this file is newer.
 |---|---|---|
 | 1 | Repo, mirror remote, green CI | **done** |
 | 2 | Packaging spike — gates everything | **done — unpackaged Win32 wins, no MSIX** |
-| 3 | Bare connect + render, confirm audio flows | **partial** — a real stream opens and reaches `Opened`; nobody has confirmed it is *audible* |
-| 4 | `--debug-sessions`, resolve both VERIFY items | **tool done, both VERIFY items still open** |
+| 3 | Bare connect + render, confirm audio flows | **done** — audio confirmed audible out of the PC on 2026-09-14 |
+| 4 | `--debug-sessions`, resolve both VERIFY items | **done — both VERIFY items resolved 2026-09-14** |
 | 5 | `core/` traits + `FakeConnection` + health state machine | **done** |
 | 6 | `platform/` impls behind the traits, `recover()` wired | **next** |
 | 7 | Re-arm triggers | not started |
@@ -38,35 +38,52 @@ the API corrections are in `docs/verify.md` — **read that file before touching
 
 ## Do this next
 
-### Step 1 — resolve the two VERIFY items (needs the phone, ~5 minutes)
+### The hardware questions are answered — read this before `platform/`
 
-Do this **before** writing `platform/`, because the answer changes what the
-real `AudioMeter` implementation is allowed to do.
+Resolved on 2026-09-14 with the phone actually streaming. Full evidence and the
+raw tables are in `docs/verify.md`; these are the conclusions that change code.
 
-Two processes at once, with music playing on the iPhone:
+1. **Signal A is session-attributable.** A2DP audio renders from a protected
+   `svchost.exe`, not the pid-0 audio engine, and its session meter tracked the
+   endpoint to four decimals while every other session read exactly zero. So
+   the real `AudioMeter` should be **session-scoped, with the endpoint meter as
+   fallback** — not the other way round.
 
-```bash
-# terminal A — holds the sink open for ~20s after the phone connects
-cargo run --bin spike-a2dp -- --open
+   Match on the session *identifier*, never the PID (`OpenProcess` is refused
+   on that process, and "svchost" would not be unique anyway).
+   `looks_like_a2dp_session` in `debug_sessions.rs` is the existing heuristic.
 
-# terminal B — while A is streaming
-cargo run --bin purptoof -- --debug-sessions
-```
+   This is not academic: mid-run, another app on the PC pushed the endpoint
+   meter to 0.0626 — 100x `SILENCE_EPS` — while A2DP was genuinely silent. The
+   endpoint meter would have reported healthy audio during a dead stretch.
 
-Then answer, and record in `docs/verify.md`:
+2. **Signal B is unavailable, permanently, on this hardware.** GSMTC returns
+   *no sessions at all* while the iPhone streams. The app ships degraded and
+   the UI has to say so.
 
-1. **Signal A attribution.** Does a WASAPI session appear that corresponds to
-   the phone's audio, and what PID owns it? If it lands on
-   `<audio engine / system>` (pid 0), Signal A **cannot** be session-scoped and
-   must use the endpoint meter — which means other apps' audio can mask A2DP
-   silence, and Signal B has to carry more weight.
-2. **Signal B availability.** Does the iPhone publish a GSMTC session with a
-   usable `PlaybackStatus` while streaming? With the phone idle it published
-   **nothing**, despite having an `Avrcp Transport` PnP node. If it stays
-   absent while streaming, the app ships permanently degraded and the UI has
-   to say so.
+3. **Pause is indistinguishable from a dead audio path.** A user pause holds
+   link `Opened`, session `Active`, peak exactly `0.000000`, indefinitely — the
+   same signature a dead path produces. So:
 
-### Step 2 — milestone 6, `platform/`
+   - `recover_without_remote_signal` stays **off by default**. This is now
+     measured, not merely cautious.
+   - The manual **Reconnect** button is the primary recovery path for the
+     silent-failure case, not a convenience.
+   - The **live peak meter is the headline UI element** — the user is the only
+     reliable discriminator, because they know whether they pressed pause.
+
+4. **One safe auto-recover signature survives:** link `Opened` **+** session
+   `Inactive`. Pause and a full reroute-away were both measured as `Active`, so
+   nothing the user does on the phone can produce it. Whether a *real* fault
+   produces it is unverified — so treat it as a trigger worth acting on, never
+   as the only thing the watchdog watches.
+
+5. **Do not read link state from a second connection object.** A probe
+   `AudioPlaybackConnection` kept reporting `Opened` after the process actually
+   holding the sink had closed it. `platform/` must read state from the
+   connection it owns.
+
+### Step 1 — milestone 6, `platform/`
 
 Implement the four traits in `src/core/traits.rs` against the real OS. The
 `--debug-sessions` COM code in `src/debug_sessions.rs` is where most of this
@@ -93,7 +110,7 @@ Carry these forward, each learned the hard way:
 - **Poll the meter at ~10 Hz** — that is the rate the fake tests assume and
   what `--debug-sessions` samples at.
 
-### Step 3 — milestone 7 onward
+### Step 2 — milestone 7 onward
 
 Triggers, then UI, then config file I/O and logging, then soak. The trigger
 plumbing feeds `HealthMonitor::note_trigger`, which already debounces a burst
@@ -160,15 +177,16 @@ Beyond CLAUDE.md's sketch, in ways that matter:
 ## Commands
 
 ```bash
-cargo test                                  # 57 tests, ~0.2s
+cargo test                                  # 67 tests, ~0.2s
 cargo clippy --all-targets -- -D warnings   # what CI gates on
 cargo fmt --check
 pwsh -File scripts/check-test-ratio.ps1     # the 0.9:1 gate on core/
 
 cargo run --bin purptoof -- --debug-sessions   # read-only, safe any time
+cargo run --bin purptoof -- --watch=120         # read-only, one line per second
 cargo run --bin spike-a2dp                     # read-only: enumerate + construct
 cargo run --bin spike-a2dp -- --start-only     # exercises the radio, moves no audio
-cargo run --bin spike-a2dp -- --open           # OPENS A STREAM — routes phone audio
+cargo run --bin spike-a2dp -- --open --hold=N  # OPENS A STREAM — routes phone audio
 ```
 
 `cargo nextest run --no-tests=pass` is what CI runs; nextest is not installed
@@ -189,13 +207,9 @@ what CLAUDE.md's Repository section describes; do not "fix" it.
 
 ## Open questions for Noah
 
-1. **Was the audio ever audible?** The stream reached `Opened` but nobody has
-   confirmed sound actually came out of the speakers. Milestone 3 is marked
-   partial for this reason alone.
-2. **Did he disconnect the phone ~10s into the `--open` run, or did it drop by
-   itself?** His later report of tapping the PC in the iPhone's Bluetooth menu
-   is the leading explanation, but iOS tearing down an idle A2DP stream has
-   not been ruled out. The two imply different steady-state behaviour.
-3. **Radio selective suspend** on the Intel adapter has never been read. Low
-   priority, but it explains a class of failures the watchdog can only paper
-   over.
+1. **Does the A2DP session identifier survive a reconnect?** One `--watch` run
+   spanning a disconnect and reconnect would answer it. Not blocking —
+   `looks_like_a2dp_session` deliberately does not depend on the GUID.
+2. **Radio selective suspend** on the Intel adapter has still never been read.
+   Low priority, but it explains a class of failures the watchdog can only
+   paper over.

@@ -134,6 +134,9 @@ them, which is the whole reason it prints the layer numbers.
 
 ## PARTIAL: Signal A - the machinery works, A2DP attribution still unknown
 
+> **SUPERSEDED 2026-09-14.** Resolved by the streaming run below; kept for
+> the reasoning, not the conclusion.
+
 Run on 2026-09-11 with Discord audio playing and the phone idle. Default
 render endpoint was `Headphones (A50 X Game)`.
 
@@ -161,6 +164,9 @@ have, and an argument for keeping HRESULT-returning calls wrapped in one
 named helper each rather than inlined at call sites.
 
 ## PARTIAL: Signal B - no session from the phone while idle
+
+> **SUPERSEDED 2026-09-14.** Resolved by the streaming run below; kept for
+> the reasoning, not the conclusion.
 
 Same run. GSMTC returned exactly **one** session, and it was not the phone:
 
@@ -197,14 +203,232 @@ explicitly, or it will be lumped in with something it is not.
 
 ---
 
+---
+
+# Run 2026-09-14 - the phone actually streaming
+
+Both PARTIAL sections above were blocked on the same missing condition: nobody
+had observed `--debug-sessions` while the iPhone was genuinely playing. This
+session supplied it, over three attempts, and resolves both. It also settles
+the health model in a way CLAUDE.md's sketch does not anticipate.
+
+Method: `spike-a2dp --open --hold=N` holding the sink up in one process, and a
+new `purptoof --watch=N` sampling once a second in another, while the phone was
+driven through play / pause / reroute-away / reroute-back.
+
+## Two procedural traps, each of which cost a run
+
+- **Start music on the phone BEFORE routing it to the PC.** Connect first and
+  then go looking for a music app and iOS drops the route during the idle gap.
+  Attempt 1 died this way.
+- **iOS Settings > Bluetooth lies here.** It read "Not Connected" for entire
+  sessions while audio was demonstrably streaming. When the PC is the A2DP
+  *sink* the phone is the *source*, and iOS treats that as an audio route, not
+  a connected accessory. Control Center's output picker is the screen that
+  reflects reality. Never judge a test by the Bluetooth screen.
+
+## RESOLVED: audio is audible - milestone 3 closes
+
+Sound came out of the PC, confirmed by ear and by meter. The end-to-end path
+works. Everything remaining is about keeping it alive.
+
+## RESOLVED: Signal A - A2DP audio IS session-attributable
+
+The favourable outcome, and not the one the PARTIAL above expected.
+
+With music streaming, endpoint peak held ~0.43 and exactly one session tracked
+it:
+
+| session | state | peak max over window |
+|---|---|---|
+| `msedgewebview2.exe` (28288) | Inactive | 0.000000 |
+| `wallpaper64.exe` (8644) | Inactive | 0.000000 |
+| `steam.exe` (6848) | Inactive | 0.000000 |
+| `<audio engine / system>` (0) | Inactive | 0.000000 |
+| `iw3sp.exe` (28768) | Active | 0.000000 |
+| **`svchost.exe` (4312)** | **Active** | **0.443092** |
+
+Endpoint max over the same window was 0.443333. The A2DP session tracked it to
+four decimals; every other session was flat zero.
+
+- A2DP render audio does **not** land on the pid-0 audio engine. Signal A can
+  be session-scoped. CLAUDE.md's fallback-to-endpoint-meter contingency is not
+  the primary path.
+- It is **not** attributable by PID. The owner is a protected `svchost.exe`
+  that `OpenProcess` refuses even with `PROCESS_QUERY_LIMITED_INFORMATION`, and
+  "svchost" would not be unique if it did.
+- The usable key is `IAudioSessionControl2::GetSessionIdentifier()`:
+
+  ```
+  {0.0.0.00000000}.{a1b9084c-...}|\Device\HarddiskVolume2\Windows\System32\svchost.exe%b{C55CBD10-423D-4D4F-8D35-C4044AA8EBFC}
+  ```
+
+  The trailing GUID is the session grouping param, and it appears in the
+  *session* identifier rather than only the *instance* identifier - suggesting
+  a fixed GUID for the Bluetooth audio render service rather than a
+  per-connection random. Byte-identical across every sample in this session.
+
+  **NOT VERIFIED:** stability across reconnect, reboot, or another machine.
+  `looks_like_a2dp_session` therefore matches on the `\system32\svchost.exe`
+  path and treats the GUID as documentation only. A caller finding no match
+  must fall back to the endpoint meter, never conclude the stream is dead.
+
+These identifiers allocate with `CoTaskMemAlloc` and the caller owns them;
+`pwstr_field` is the single place that ownership rule lives.
+
+### Endpoint masking, caught in the wild
+
+Mid-pause, with A2DP silent, something else on the PC made a noise:
+
+```
+   85  Opened   0.000012  Active/0.000000
+   86  Opened   0.000013  Active/0.000000
+   87  Opened   0.062576  Active/0.000000
+   88  Opened   0.000013  Active/0.000000
+```
+
+The endpoint meter read 0.0626 - over 100x `SILENCE_EPS` - while the attributed
+session correctly read exactly 0.0. Had Signal A been endpoint-scoped, that
+sample would have reported healthy audio during a silent stretch. This is the
+masking failure mode, observed rather than theorised, and it is the argument
+for session-scoping being the primary path.
+
+## RESOLVED: Signal B is UNAVAILABLE on this hardware
+
+GSMTC returned **no sessions at all** while the iPhone was actively streaming
+music. Not a session with poor metadata - nothing.
+
+The earlier PARTIAL left open that a session might materialise once the remote
+was really playing over a live AVRCP link. It does not. The `Noah's iPhone
+Avrcp Transport` PnP node exists and publishes nothing GSMTC can see.
+
+**The app ships permanently degraded on Signal B**, and the UI must say so.
+
+## RESOLVED: the health model - what is and is not distinguishable
+
+The decisive run. A 230s `--watch` while the phone was driven through four
+states:
+
+| phone / sink state | window | link | a2dp session | peak |
+|---|---|---|---|---|
+| playing | t=1-44, 107-132, 175-217 | `Opened` | `Active` | ~0.42 |
+| **paused in the music app** | t=45-106 | `Opened` | `Active` | **0.000000** |
+| **rerouted back to the iPhone** | t=133-172 | `Opened` | `Active` | **0.000000** |
+| **our own sink closed** | t=218-230 | `Opened` | **`Inactive`** | 0.000000 |
+
+### Pause is indistinguishable from a dead audio path
+
+A user pause presents as link `Opened`, session present and `Active`, peak
+exactly zero, indefinitely - held for 62 seconds here. That is precisely the
+signature a dead audio path produces. With Signal B unavailable, **no
+observation available to this app separates them.**
+
+Consequences, and these are design-level:
+
+- `recover_without_remote_signal` must stay **off by default**. Auto-recovering
+  on silence alone fires on every pause - the reconnect storm CLAUDE.md
+  correctly names as worse than the original bug.
+- The manual **Reconnect** button is not a convenience. On this hardware it is
+  the primary recovery path for the silent-failure case. Prominent, always
+  enabled.
+- The **live peak meter is the headline UI element**, because the user is the
+  only reliable discriminator - they know whether they pressed pause.
+
+### `Active` does not mean frames are arriving
+
+Worth recording because it is the obvious hypothesis and it is wrong. The idea
+was that iOS keeps pushing silence frames while paused, so a genuinely dead
+path would stop them and WASAPI would flip the session to `Inactive`.
+
+It does not hold: the session stayed `Active` for 40 seconds after the audio
+was routed **away from the PC entirely** (t=133-172). `Active` tracks "our sink
+is open", not frame flow.
+
+### The one discriminator that survives, and why it is safe
+
+`Inactive` appeared exactly once, at t=218, the moment the spike's hold expired
+and called `Close()`. So:
+
+- `Opened` + `Active` + zero peak -> **ambiguous.** Pause, reroute-away, and a
+  dead path are identical. Never auto-recover.
+- `Opened` + **`Inactive`** -> the render client stopped while we still believe
+  we hold the sink open. **Safe to treat as a fault.**
+
+The safety argument does not depend on knowing what a real fault looks like -
+which is fortunate, because the fault is not producible on demand. It rests on
+the benign cases: pause and reroute-away were both measured as `Active`, so
+neither can generate this signature. Acting on it cannot fire on anything the
+user does with the phone.
+
+Treat "a real fault presents as `Inactive`" as **unverified**. Treat "acting on
+`Inactive` is safe" as supported by this run.
+
+### Caveat: a second connection object does not mirror link state
+
+The `--watch` link column comes from its own `AudioPlaybackConnection`,
+constructed but never started. It kept reporting `Opened` for t=218-230, after
+the spike had closed the connection that was actually holding the sink.
+
+**`platform/` must read link state from the connection it owns**, and must not
+use a probe object as a health signal. Layer 2 of `--debug-sessions` carries
+the same caveat and its NOTE understates it.
+
+### Partially corrects the earlier teardown theory
+
+The old "cause of the unprompted `Opened -> Closed`" entry led with "user tapped
+the PC in the iPhone's Bluetooth menu". That is now **ruled out** - nothing in
+Bluetooth settings was touched in any attempt, and the link still closed in
+attempt 1.
+
+What replaces it is **not** settled:
+
+- Attempt 1: audio stopped, the user moved to a music app, link closed ~10s
+  later.
+- Attempt 3: music paused, the user left the music app to type, link stayed
+  `Opened` for a further ~55s; and a full reroute back to the iPhone also left
+  it `Opened` for 40s.
+
+Leaving the foreground app is therefore **not** the trigger. The surviving
+difference is whether an app on the phone still held an audio session -
+paused-but-loaded versus fully finished. Plausible, one observation each way,
+**not verified**.
+
+The app's handling is unchanged either way: `Closed` is benign, re-arm handles
+it, and re-arm skips the backoff ladder.
+
+## Tooling changes made during this run
+
+- **`--watch[=SECS]`** added: one line per second of link state, endpoint peak,
+  and the attributed A2DP session's state and peak. It exists because every
+  interesting question here is about a *transition*, and a one-shot dump
+  requires the operator to hold the phone and the keyboard at the same instant.
+  Read-only - it never advertises a sink or opens a stream.
+- **`--debug-sessions` sampling order fixed.** It sampled the endpoint for 6s
+  and *then* read each session peak once, so any audio that stopped before the
+  second pass reported six zeroes next to a moving endpoint. It now meters the
+  endpoint and every session on the same ~10 Hz tick and reports per-session
+  maxima. Attribution was only readable after this change.
+- **`spike-a2dp --hold=SECS`** added, so a run can be held open long enough to
+  drive the phone through a sequence.
+
+---
+
 ## STILL OPEN
 
-- **Signal A attribution for A2DP specifically** - see PARTIAL above. Needs
-  `--debug-sessions` while the phone streams.
-- **Signal B availability while streaming** - see PARTIAL above.
-- **Cause of the unprompted `Opened -> Closed`.** Best lead so far: the user
-  reports tapping the PC in the iPhone's Bluetooth menu around that time,
-  which would explain a brief drop. Still not distinguished from an idle
-  teardown.
+- **Session identifier stability.** The A2DP session's grouping GUID
+  `{C55CBD10-...}` was byte-identical across every sample in one session, but
+  has never been checked across a reconnect, a reboot, or another machine.
+  `looks_like_a2dp_session` deliberately does not depend on it. If it turns out
+  stable, matching can tighten; if it turns out per-connection, nothing breaks.
+- **Whether a real fault presents as `Inactive`.** The one discriminator left
+  rests on an untestable premise - the fault is not producible on demand. Acting
+  on it is safe regardless (see above), but the app cannot rely on it *firing*.
+  The overnight soak is the first realistic chance to observe a genuine fault;
+  log the session state alongside the peak so the answer is in the log when it
+  happens.
+- **Cause of the unprompted `Opened -> Closed`.** Narrowed, not solved. Ruled
+  out: user action in the iPhone's Bluetooth menu, and leaving the foreground
+  app. Leading hypothesis: whether any app on the phone still holds an audio
+  session.
 - **Radio selective suspend.** The Intel adapter's power-management state has
-  not been read yet.
+  still never been read.
