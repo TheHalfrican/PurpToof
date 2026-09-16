@@ -6,14 +6,19 @@
 //! connected, the phone disagrees, and neither is lying - they are reporting
 //! different things.
 //!
-//! Four layers, reported separately and never conflated:
+//! Five layers, reported separately and never conflated:
 //!
+//!   0. **The adapter.** May Windows power the radio down? This sits
+//!      underneath every layer below and can take them all out at once,
+//!      while none of them can see why.
 //!   1. **Pairing / interface.** Does the A2DP sink interface enumerate at
 //!      all? This is what makes the device eligible, nothing more.
-//!   2. **Our own sink.** `AudioPlaybackConnection::State()`. Note this
-//!      reflects only the connection object *we* hold, not any system-wide
-//!      notion of connectedness - if we have not opened it, it reads `Closed`
-//!      no matter what Windows Settings displays.
+//!   2. **The sink object.** `AudioPlaybackConnection::State()`. This was
+//!      documented here as reflecting only the object *we* hold; that is
+//!      **wrong**, corrected 2026-09-16. A freshly constructed object that
+//!      was never opened read `Opened` while a separate PurpToof process
+//!      held the link. `State()` reports whether *anyone* has the device
+//!      open, so `Closed` means nobody does - not "we have not opened it".
 //!   3. **Signal A - is sound actually coming out.** The default render
 //!      endpoint's peak meter, plus every audio session on that endpoint with
 //!      its owning process, so we can see whether A2DP render audio is
@@ -33,9 +38,11 @@ use anyhow::{Context, Result};
 
 // The attribution rule lives in platform/ so the diagnostic and the real
 // AudioMeter cannot drift apart.
+use purptoof::core::power::RadioPowerPolicy;
 use purptoof::platform::a2dp_session::{
     looks_like_a2dp_session, session_identifier, session_instance_identifier,
 };
+use purptoof::platform::radio_power;
 use windows::Devices::Enumeration::DeviceInformation;
 use windows::Media::Audio::{AudioPlaybackConnection, AudioPlaybackConnectionState};
 use windows::Media::Control::{
@@ -66,6 +73,7 @@ const SAMPLE_SECS: u32 = 6;
 pub fn run() -> Result<()> {
     println!("PurpToof --debug-sessions (read-only)\n");
 
+    report_radio_power()?;
     report_pairing()?;
     report_our_sink()?;
     report_remote_playback()?;
@@ -78,6 +86,44 @@ pub fn run() -> Result<()> {
          playing. The watchdog fires on the CONJUNCTION - remote says Playing and\n\
          the endpoint is silent - never on either alone."
     );
+    Ok(())
+}
+
+// --- Layer 0: the adapter itself -------------------------------------------
+
+/// Whether Windows is allowed to power the radio down.
+///
+/// Not a "layer" in the connection sense - it sits underneath all of them,
+/// because an adapter Windows may switch off can take every layer above it
+/// down at once, and none of those layers can see why.
+fn report_radio_power() -> Result<()> {
+    println!("== layer 0: may Windows power the adapter down? ==");
+
+    let devnode = match unsafe { radio_power::adapter_devnode_id() } {
+        Ok(d) => d,
+        Err(e) => {
+            println!("  could not identify the adapter: {e}");
+            println!("  -> reported as Unknown, which never raises the warning.");
+            return Ok(());
+        }
+    };
+    println!("  devnode: {devnode}");
+
+    match radio_power::policy_for(&devnode) {
+        RadioPowerPolicy::MayPowerDown => {
+            println!("  IdleInWorkingState is set -> WINDOWS MAY POWER THIS DOWN.");
+            println!("     CLAUDE.md names this as a cause of this symptom class.");
+        }
+        RadioPowerPolicy::HeldOn => {
+            println!("  IdleInWorkingState = 0 -> the radio is held on. Good.");
+        }
+        RadioPowerPolicy::Unknown => {
+            println!("  IdleInWorkingState absent -> unknown; no claim made.");
+            println!("     The driver default applies, and this project has not");
+            println!("     established what that default is.");
+        }
+    }
+    println!();
     Ok(())
 }
 
@@ -150,10 +196,14 @@ fn report_our_sink() -> Result<()> {
                 .unwrap_or_else(|e| format!("<{e}>"));
             println!("  constructed OK, state: {state}");
             println!(
-                "    NOTE: this is OUR connection object, which we have not opened.\n\
-                 \x20         `Closed` here is expected and says nothing about what\n\
-                 \x20         Windows Settings shows - Settings reports the Bluetooth\n\
-                 \x20         link (hands-free, AVRCP, phonebook), not this stream."
+                "    NOTE: this object was constructed here and never opened, but\n\
+                 \x20         `State()` is NOT scoped to it. Measured 2026-09-16: it\n\
+                 \x20         read `Opened` while a separate PurpToof process held the\n\
+                 \x20         link. So `Opened` means someone has this device open, and\n\
+                 \x20         `Closed` means nobody does - neither is a statement about\n\
+                 \x20         this object. Either way it says nothing about what Windows\n\
+                 \x20         Settings shows: Settings reports the Bluetooth link\n\
+                 \x20         (hands-free, AVRCP, phonebook), not this stream."
             );
             // Never advertised, so nothing to close.
             drop(c);

@@ -72,6 +72,10 @@ features = [
     "Win32_System_Variant",
     # IPropertyStore.
     "Win32_UI_Shell_PropertiesSystem",
+    # ShellExecuteExW with the "runas" verb: the one-shot elevated helper that
+    # applies the adapter power-management fix. The app itself never runs
+    # elevated - see platform/radio_power.rs.
+    "Win32_UI_Shell",
     # PKEY_Device_FriendlyName.
     "Win32_Devices_FunctionDiscovery",
     # OpenProcess / QueryFullProcessImageNameW — naming the process that owns
@@ -85,6 +89,13 @@ features = [
     # Re-arm trigger: Radio::StateChanged, for the Bluetooth adapter being
     # toggled from Action Center.
     "Devices_Radios",
+    # BluetoothDevice / BluetoothLEDevice ConnectionStatus. A phone pairs
+    # twice, over two independent bonds, and only the classic BR/EDR one
+    # carries A2DP - so "is it connected" has two different answers and
+    # Windows shows the wrong one. Reading them apart is what lets the app
+    # say "the classic bond is stale, re-pair" instead of sitting on
+    # "Waiting for a device" forever. See core/btaddr.rs.
+    "Devices_Bluetooth",
     # Autostart: the per-user Run key.
     "Win32_System_Registry",
     # AttachConsole, so a GUI-subsystem release build can still print

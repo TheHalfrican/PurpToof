@@ -10,9 +10,11 @@
 //! `scripts/check-test-ratio.ps1` for why.
 
 pub mod backoff;
+pub mod btaddr;
 pub mod config;
 pub mod health;
 pub mod paths;
+pub mod power;
 pub mod supervisor;
 pub mod traits;
 pub mod types;
@@ -20,9 +22,11 @@ pub mod types;
 #[cfg(test)]
 pub mod fakes;
 
+pub use btaddr::{BtAddr, address_from_interface_id};
 pub use config::Config;
 pub use health::HealthMonitor;
 pub use paths::{Mode, Paths};
+pub use power::{RadioPowerPolicy, classify as classify_radio_power, devnode_id_from_interface_id};
 pub use supervisor::{Supervisor, Tick};
 pub use traits::{AudioMeter, Clock, RemotePlayback, SinkConnection, SinkError, SystemClock};
 pub use types::{

@@ -34,8 +34,10 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
+use crate::core::power::RadioPowerPolicy;
 use crate::core::{Action, Config, HealthStatus, Supervisor, SystemClock, Tick, Trigger};
 use crate::platform::meter::MeterScope;
+use crate::platform::radio_power;
 use crate::platform::triggers::{DefaultDeviceWatch, Triggers};
 use crate::platform::{GsmtcRemote, Sink, WasapiMeter};
 
@@ -106,6 +108,17 @@ pub struct Snapshot {
     /// can fail to construct, and a silent failure looks exactly like a device
     /// change that never happens.
     pub device_watch_active: bool,
+    /// Whether Windows may power the Bluetooth adapter down.
+    ///
+    /// Resolved once at startup and after the user applies the fix. It is a
+    /// static setting that only a human changes, so re-reading it at the tick
+    /// rate would be a registry hit every 100ms for a value that moves twice a
+    /// year.
+    pub radio_power: RadioPowerPolicy,
+    /// The adapter's devnode id, for the fix to act on. `None` when the
+    /// adapter could not be identified, which is also why `radio_power` would
+    /// read `Unknown`.
+    pub adapter_devnode: Option<String>,
     /// Benign re-arms dispatched so far, with the most recent reason.
     ///
     /// Deliberately NOT in `log` - the reconnect log is for genuine recoveries
@@ -130,6 +143,8 @@ impl Default for Snapshot {
             device_name: String::new(),
             triggers_registered: 0,
             device_watch_active: false,
+            radio_power: RadioPowerPolicy::Unknown,
+            adapter_devnode: None,
             rearms: 0,
             last_rearm: None,
             log_len: 0,
@@ -276,8 +291,23 @@ fn worker_main(
     };
 
     let device_name = sink.device().name.clone();
+
+    // Read once, here, on the COM-initialised thread. An adapter that Windows
+    // is allowed to switch off sits underneath every signal the supervisor
+    // watches and can take them all out at once, so the user is told even
+    // though nothing in the state machine acts on it.
+    let adapter_devnode = unsafe { radio_power::adapter_devnode_id() }
+        .inspect_err(|e| tracing::warn!(error = %e, "could not identify the Bluetooth adapter"))
+        .ok();
+    let radio_power = adapter_devnode
+        .as_deref()
+        .map(radio_power::policy_for)
+        .unwrap_or(RadioPowerPolicy::Unknown);
+
     if let Ok(mut s) = shared.lock() {
         s.device_name = device_name;
+        s.radio_power = radio_power;
+        s.adapter_devnode = adapter_devnode;
     }
 
     let mut sup = Supervisor::new(SystemClock, config, sink, meter, remote);

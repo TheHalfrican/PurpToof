@@ -1,12 +1,14 @@
 //! The single view.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 
+use crate::core::power::RadioPowerPolicy;
 use crate::core::{Config, HealthStatus, Paths, Trigger};
 use crate::platform::autostart;
 use crate::platform::meter::MeterScope;
+use crate::platform::radio_power;
 use crate::platform::worker::{LogEntry, PEAK_HISTORY};
 use crate::platform::{Snapshot, Worker};
 use crate::ui::tray::{Tray, TrayAction};
@@ -63,6 +65,15 @@ pub struct PurpToofApp {
     /// Surfaced next to the settings when a save fails - a silently ignored
     /// checkbox is worse than one that says why it did not stick.
     settings_error: Option<String>,
+    /// The adapter power policy as last re-read here, overriding the worker's
+    /// startup reading once a fix has been applied. `None` until then.
+    radio_power_now: Option<RadioPowerPolicy>,
+    /// When to re-read that policy next.
+    ///
+    /// Set only while a fix is in flight. `ShellExecuteExW` returns when the
+    /// UAC prompt is answered, not when the change has landed, so the banner
+    /// watches for the value to flip rather than assuming it worked.
+    radio_recheck_at: Option<Instant>,
     /// Whether the initial hide has been applied. eframe has no viewport to
     /// command until the first frame, so start-minimized cannot be honoured
     /// in `new`.
@@ -86,6 +97,8 @@ impl PurpToofApp {
             config: settings,
             paths,
             settings_error: None,
+            radio_power_now: None,
+            radio_recheck_at: None,
             worker,
             log: Vec::new(),
             log_len: 0,
@@ -235,7 +248,7 @@ impl eframe::App for PurpToofApp {
             // Footnotes first, laid out bottom-up, so the log can then expand
             // into whatever height is left rather than leaving dead space.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                footnotes(ui, &snap);
+                footnotes(ui, &snap, self);
                 ui.separator();
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     reconnect_log(ui, &self.log);
@@ -607,7 +620,9 @@ fn stamp(entry: &LogEntry) -> String {
     }
 }
 
-fn footnotes(ui: &mut egui::Ui, snap: &Snapshot) {
+fn footnotes(ui: &mut egui::Ui, snap: &Snapshot, app: &mut PurpToofApp) {
+    radio_power_banner(ui, snap, app);
+
     // Stated as a property of the device, not a warning. On this hardware it is
     // permanently true, and a red banner would make a working app look broken.
     if snap.status == HealthStatus::Degraded {
@@ -653,6 +668,74 @@ fn footnotes(ui: &mut egui::Ui, snap: &Snapshot) {
             .size(10.0)
             .color(AMBER),
         );
+    }
+}
+
+/// How often to re-read the adapter policy while a fix is in flight.
+const RADIO_RECHECK: Duration = Duration::from_secs(1);
+
+/// The adapter power-management banner, and the one-click fix.
+///
+/// Shown only when the policy was **positively** read as "may power down".
+/// `Unknown` stays silent - see `core::power` on why an absent value is not
+/// evidence of anything.
+///
+/// The exact change is spelled out *before* the button rather than after.
+/// "One click" must not mean "one click and you find out afterwards what
+/// happened", and the UAC prompt names PowerShell, which explains nothing on
+/// its own.
+fn radio_power_banner(ui: &mut egui::Ui, snap: &Snapshot, app: &mut PurpToofApp) {
+    // A fix is in flight: re-read on a timer until the value flips. The
+    // elevated helper runs *after* `ShellExecuteExW` returns, so there is
+    // nothing to read at the moment of the click and the banner has to wait
+    // for the change rather than congratulate itself.
+    if let (Some(at), Some(devnode)) = (app.radio_recheck_at, snap.adapter_devnode.as_deref())
+        && Instant::now() >= at
+    {
+        let latest = radio_power::policy_for(devnode);
+        app.radio_power_now = Some(latest);
+        app.radio_recheck_at = latest.should_warn().then(|| Instant::now() + RADIO_RECHECK);
+        ui.ctx().request_repaint_after(RADIO_RECHECK);
+    }
+
+    let policy = app.radio_power_now.unwrap_or(snap.radio_power);
+    if !policy.should_warn() {
+        return;
+    }
+    // Nothing to act on without the devnode, and a warning the user cannot do
+    // anything about is just noise.
+    let Some(devnode) = snap.adapter_devnode.clone() else {
+        return;
+    };
+
+    ui.label(
+        RichText::new("Windows is allowed to power down the Bluetooth adapter.")
+            .size(10.0)
+            .color(AMBER),
+    );
+    ui.label(
+        RichText::new(radio_power::FIX_DESCRIPTION)
+            .size(10.0)
+            .color(DIM),
+    );
+
+    if app.radio_recheck_at.is_some() {
+        ui.label(
+            RichText::new("Waiting for Windows to apply it...")
+                .size(10.0)
+                .color(DIM),
+        );
+        return;
+    }
+
+    if ui.button("Stop Windows powering it down").clicked() {
+        match radio_power::request_hold_radio_on(&devnode) {
+            Ok(()) => app.radio_recheck_at = Some(Instant::now() + RADIO_RECHECK),
+            // Declining the prompt lands here too. That is an ordinary answer,
+            // so it is reported where the other settings failures are and not
+            // as a fault.
+            Err(e) => app.settings_error = Some(format!("could not start the fix: {e}")),
+        }
     }
 }
 

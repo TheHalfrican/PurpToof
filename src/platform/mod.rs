@@ -20,6 +20,7 @@
 pub mod a2dp_session;
 pub mod autostart;
 pub mod meter;
+pub mod radio_power;
 pub mod remote;
 pub mod sink;
 pub mod triggers;
