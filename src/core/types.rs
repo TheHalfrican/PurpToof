@@ -52,8 +52,11 @@ impl PlaybackStatus {
 /// Mirrors `AudioPlaybackConnectionState`. This is a **link** signal, not a
 /// flow signal - the entire premise of this project is that it can read
 /// `Opened` while no audio is moving. Never decide health from it alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkState {
+    /// The default, because it is the state that claims the least. An
+    /// `Observation` built without one must not assert a live link.
+    #[default]
     Closed,
     Opened,
 }
@@ -153,8 +156,39 @@ pub enum RecoveryOutcome {
     NoRemote,
 }
 
+/// What the Bluetooth stack says about the remote's two bonds.
+///
+/// A phone pairs **twice**, over two independent bonds with separate link
+/// keys, and only the classic BR/EDR one carries A2DP. Windows displays a
+/// single "Connected" that can be true of the LE half while the classic half
+/// is unusable - which is exactly the state that produced an outage on
+/// 2026-09-15, with the app stuck on "Waiting for a device" for a day.
+///
+/// `None` on either field means "could not read it", never "not connected".
+/// The distinction is load-bearing: the whole point of this type is to stop
+/// one bond's state being reported as the other's, and an unreadable value
+/// standing in for `false` would reintroduce exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Presence {
+    /// Classic BR/EDR. A2DP rides only on this one.
+    pub classic: Option<bool>,
+    /// Low Energy. Almost always what Windows Settings is reporting when it
+    /// says "Connected" and no audio is possible.
+    pub le: Option<bool>,
+}
+
+impl Presence {
+    /// Whether the phone is demonstrably nearby but unable to carry audio.
+    ///
+    /// Positive evidence on both halves is required. Unknown on either is not
+    /// evidence of anything - see the type docs.
+    pub fn classic_down_while_le_up(self) -> bool {
+        self.le == Some(true) && self.classic == Some(false)
+    }
+}
+
 /// One sample of the world, as seen from outside the connection object.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Observation {
     /// Link state of our own sink connection.
     pub link: LinkState,
@@ -164,6 +198,14 @@ pub struct Observation {
     pub remote: Option<PlaybackStatus>,
     /// Signal A. Peak amplitude from the render meter, 0.0 ..= 1.0.
     pub peak: f32,
+    /// The two bonds, read from outside our connection object entirely.
+    ///
+    /// Not a third signal in the decision rule - it never authorises a
+    /// recovery, because no number of reconnects can mint a link key. It
+    /// exists so the app can tell "the phone is in another room" apart from
+    /// "the phone is right here and the pairing is broken", which are
+    /// otherwise the same `ERROR_GEN_FAILURE` from `Open()`.
+    pub presence: Presence,
 }
 
 /// The honest status line, for the UI.
@@ -188,4 +230,74 @@ pub enum HealthStatus {
     /// Running without Signal B. Auto-recovery is restricted; say so rather
     /// than pretending everything is normal.
     Degraded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `None` means "could not read it", never "not connected".
+    ///
+    /// This is the whole reason `Presence` uses `Option<bool>` rather than
+    /// `bool`. Letting an unreadable value stand in for `false` would let a
+    /// failed WinRT query look exactly like a dead bond - and whatever rule
+    /// eventually consumes this, that confusion must never be available to it.
+    #[test]
+    fn an_unreadable_bond_is_never_read_as_disconnected() {
+        for presence in [
+            Presence {
+                classic: None,
+                le: Some(true),
+            },
+            Presence {
+                classic: Some(false),
+                le: None,
+            },
+            Presence {
+                classic: None,
+                le: None,
+            },
+        ] {
+            assert!(
+                !presence.classic_down_while_le_up(),
+                "{presence:?} is not evidence of anything"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_evidence_on_both_halves_is_required() {
+        assert!(
+            Presence {
+                classic: Some(false),
+                le: Some(true)
+            }
+            .classic_down_while_le_up()
+        );
+    }
+
+    #[test]
+    fn a_working_classic_bond_is_not_flagged_whatever_le_says() {
+        // The bond that carries audio is up. Nothing else matters.
+        for le in [Some(true), Some(false), None] {
+            let presence = Presence {
+                classic: Some(true),
+                le,
+            };
+            assert!(!presence.classic_down_while_le_up(), "{presence:?}");
+        }
+    }
+
+    #[test]
+    fn both_bonds_down_is_a_phone_in_another_room() {
+        // The overwhelmingly common case, and the one that must never be
+        // confused with a fault.
+        assert!(
+            !Presence {
+                classic: Some(false),
+                le: Some(false)
+            }
+            .classic_down_while_le_up()
+        );
+    }
 }

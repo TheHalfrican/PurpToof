@@ -34,7 +34,7 @@ use crate::core::config::Config;
 use crate::core::health::HealthMonitor;
 use crate::core::traits::{AudioMeter, Clock, RemotePlayback, SinkConnection, SinkError};
 use crate::core::types::{
-    Action, HealthStatus, LinkState, Observation, ReArmReason, RecoveryOutcome, Trigger,
+    Action, HealthStatus, LinkState, Observation, Presence, ReArmReason, RecoveryOutcome, Trigger,
 };
 
 /// What one [`Supervisor::tick`] did. Returned for logging and tests; the
@@ -67,6 +67,14 @@ where
     /// single-flight guard for the open itself; `HealthMonitor` separately
     /// suppresses new decisions while it believes an operation is running.
     awaiting_open: Option<Instant>,
+    /// The remote's two bonds, pushed in from outside rather than read here.
+    ///
+    /// Not behind a trait like the other three signals, deliberately. Reading
+    /// it is a WinRT round-trip per bond and it changes on the timescale of a
+    /// person walking out of the room, so the owner samples it slowly and
+    /// hands it over; polling it at the tick rate would cost far more than it
+    /// could ever tell us.
+    presence: Presence,
 }
 
 impl<S, M, R, C> Supervisor<S, M, R, C>
@@ -84,6 +92,7 @@ where
             meter,
             remote,
             awaiting_open: None,
+            presence: Presence::default(),
         }
     }
 
@@ -100,6 +109,14 @@ where
 
     pub fn note_trigger(&mut self, trigger: Trigger) {
         self.monitor.note_trigger(trigger);
+    }
+
+    /// Update what we believe about the remote's bonds.
+    ///
+    /// Cheap and idempotent; the owner may call it as often or as rarely as
+    /// it likes. It never itself provokes a decision.
+    pub fn note_presence(&mut self, presence: Presence) {
+        self.presence = presence;
     }
 
     pub fn sink(&self) -> &S {
@@ -151,6 +168,7 @@ where
             link: self.sink.link_state(),
             remote: self.remote.status(),
             peak: self.meter.peak(),
+            presence: self.presence,
         }
     }
 

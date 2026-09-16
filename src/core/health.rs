@@ -355,7 +355,7 @@ impl<C: Clock> HealthMonitor<C> {
 mod tests {
     use super::*;
     use crate::core::fakes::FakeClock;
-    use crate::core::types::PlaybackStatus;
+    use crate::core::types::{PlaybackStatus, Presence};
     use std::time::Duration;
 
     const AUDIBLE: f32 = 0.5;
@@ -370,7 +370,12 @@ mod tests {
     }
 
     fn obs(link: LinkState, remote: Option<PlaybackStatus>, peak: f32) -> Observation {
-        Observation { link, remote, peak }
+        Observation {
+            link,
+            remote,
+            peak,
+            presence: Presence::default(),
+        }
     }
 
     fn open_playing(peak: f32) -> Observation {
@@ -1199,6 +1204,78 @@ mod tests {
     // Property-based invariants
     // =====================================================================
 
+    /// The guarantee that makes `Presence` safe to carry at all.
+    ///
+    /// It is an **observation**, not a signal: nothing reads it to decide
+    /// anything, and it must stay that way until a rule has been earned from
+    /// measured data rather than reasoned out from one incident. A first
+    /// attempt at such a rule was written and removed - it would have fired
+    /// on the normal idle state, where the phone sits nearby with no audio
+    /// route, because `(Closed, LE up, classic down)` describes that just as
+    /// well as it describes a stale pairing.
+    ///
+    /// This test is what stops the same mistake being made quietly. Anything
+    /// wiring presence into the decision table has to fail here first, and be
+    /// argued for on purpose.
+    #[test]
+    fn presence_never_changes_a_decision() {
+        let interesting = [
+            Presence::default(),
+            Presence {
+                classic: Some(false),
+                le: Some(true),
+            },
+            Presence {
+                classic: Some(true),
+                le: Some(false),
+            },
+            Presence {
+                classic: Some(false),
+                le: Some(false),
+            },
+        ];
+
+        let mut baseline: Option<Vec<Action>> = None;
+        for presence in interesting {
+            let clock = FakeClock::new();
+            let mut m = monitor(&clock);
+            let mut actions = Vec::new();
+
+            // A sequence that visits every interesting combination of link,
+            // remote and peak, so the comparison is not over a trivial run.
+            for i in 0..200 {
+                let link = if i % 3 == 0 {
+                    LinkState::Closed
+                } else {
+                    LinkState::Opened
+                };
+                let remote = if i % 5 == 0 {
+                    Some(PlaybackStatus::Playing)
+                } else {
+                    None
+                };
+                let peak = if i % 7 == 0 { AUDIBLE } else { SILENT };
+
+                actions.push(m.observe(Observation {
+                    link,
+                    remote,
+                    peak,
+                    presence,
+                }));
+                m.recovery_finished(RecoveryOutcome::NoRemote);
+                clock.advance_ms(500);
+            }
+
+            match &baseline {
+                None => baseline = Some(actions),
+                Some(b) => assert_eq!(
+                    *b, actions,
+                    "{presence:?} changed what the state machine decided"
+                ),
+            }
+        }
+    }
+
     mod properties {
         use super::*;
         use proptest::prelude::*;
@@ -1226,7 +1303,15 @@ mod tests {
                 peak in prop_oneof![Just(0.0f32), Just(0.5f32), 0.0f32..1.0],
                 gap_ms in 0u64..4_000,
             ) -> (Observation, u64) {
-                (Observation { link, remote, peak }, gap_ms)
+                (
+                    Observation {
+                        link,
+                        remote,
+                        peak,
+                        presence: Presence::default(),
+                    },
+                    gap_ms,
+                )
             }
         }
 
@@ -1314,6 +1399,7 @@ mod tests {
                     link: LinkState::Opened,
                     remote: Some(status),
                     peak: 0.0,
+                    presence: Presence::default(),
                 };
 
                 for gap in gaps {
