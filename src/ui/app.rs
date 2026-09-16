@@ -13,10 +13,44 @@ use crate::platform::worker::{LogEntry, PEAK_HISTORY};
 use crate::platform::{Snapshot, Worker};
 use crate::ui::tray::{Tray, TrayAction};
 
-/// Redraw cadence. Matches the supervisor's 10 Hz tick - drawing faster would
-/// only re-render identical samples and keep a tray-resident app busy for
-/// nothing.
-const REPAINT: Duration = Duration::from_millis(100);
+/// Redraw cadence while the window is hidden in the tray.
+///
+/// Matches the supervisor's 10 Hz tick. Nothing is on screen, so this exists
+/// only to keep the tray menu being pumped - see `logic()`.
+const REPAINT_HIDDEN: Duration = Duration::from_millis(100);
+
+/// Redraw cadence while the window is on screen.
+///
+/// Faster than the 10 Hz sample rate on purpose. The samples still arrive at
+/// 10 Hz, but the bar is eased toward them between frames, so motion is
+/// continuous instead of stepping ten times a second. CLAUDE.md calls the
+/// meter "the feature"; a jerky one undersells a working link. Costs nothing
+/// while hidden, which is most of the time.
+const REPAINT_VISIBLE: Duration = Duration::from_millis(16);
+
+/// How fast the drawn bar chases the ballistic level, as a time constant.
+///
+/// Small enough to be imperceptible next to the 200ms attack; its only job is
+/// to turn 10 Hz steps into continuous motion.
+const DISPLAY_TAU: f32 = 0.04;
+
+/// Meter ballistics, per 100ms sample: rise fast, fall slowly.
+///
+/// A flat mean over one second used to drive this bar. It was added because
+/// transients pinned the bar at full scale, and it fixed that - but a mean is
+/// symmetric, so it also lagged half a second behind on the way *up*, which
+/// read as sluggish.
+///
+/// Asymmetric ballistics is what hardware meters do, and it solves both. The
+/// original complaint was never "it rises too fast", it was "one transient
+/// pins it and it stays pinned"; a fast attack with a slow release makes a
+/// transient a bump that falls away, which is what a meter is supposed to
+/// look like.
+///
+/// `ATTACK` reaches ~90% of a step in 200ms, `RELEASE` decays to ~10% in
+/// 600ms.
+const ATTACK: f32 = 0.68;
+const RELEASE: f32 = 0.32;
 
 // Dark palette. Compact, no decorative chrome, per CLAUDE.md.
 //
@@ -68,6 +102,13 @@ pub struct PurpToofApp {
     /// The adapter power policy as last re-read here, overriding the worker's
     /// startup reading once a fix has been applied. `None` until then.
     radio_power_now: Option<RadioPowerPolicy>,
+    /// The level the bar is currently drawn at, eased toward the ballistic
+    /// level each frame. Separate from the ballistics so that smoothing the
+    /// *animation* cannot change what the meter actually reports.
+    display_level: f32,
+    /// Timestamp of the previous frame, so the easing is frame-rate
+    /// independent rather than assuming a fixed step.
+    last_frame: Option<Instant>,
     /// When to re-read that policy next.
     ///
     /// Set only while a fix is in flight. `ShellExecuteExW` returns when the
@@ -97,6 +138,8 @@ impl PurpToofApp {
             config: settings,
             paths,
             settings_error: None,
+            display_level: 0.0,
+            last_frame: None,
             radio_power_now: None,
             radio_recheck_at: None,
             worker,
@@ -184,7 +227,11 @@ impl eframe::App for PurpToofApp {
     /// The repaint request is what keeps this being called at all while
     /// hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(REPAINT);
+        ctx.request_repaint_after(if self.visible {
+            REPAINT_VISIBLE
+        } else {
+            REPAINT_HIDDEN
+        });
 
         if !self.handle_window_and_tray(ctx) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -225,7 +272,9 @@ impl eframe::App for PurpToofApp {
 
             device_row(ui, &snap);
             ui.add_space(2.0);
-            meter(ui, &snap, self.eps);
+            let target = ballistic_level(&snap.peak_history, snap.peak);
+            self.display_level = ease(self.display_level, target, &mut self.last_frame);
+            meter(ui, &snap, self.eps, self.display_level);
             status_line(ui, &snap);
 
             if ui
@@ -336,7 +385,7 @@ fn link_chip(status: HealthStatus) -> (&'static str, Color32) {
 /// The history is the point. Because the app cannot distinguish a pause from a
 /// dead path, the useful question is not "is it silent" but "*when* did it go
 /// silent" - and a single bar cannot answer that.
-fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
+fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32, level: f32) {
     let trustworthy = snap.scope == MeterScope::Session;
     let level_color = if !trustworthy {
         AMBER
@@ -348,15 +397,13 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
 
     // The level shown by the bar: a short average, not the instantaneous peak.
     //
-    // GetPeakValue reports transient peaks, and on real music those hit full
-    // scale constantly - the phone was measured at 1.0002, above nominal. A
-    // bar driven by that is pinned at maximum whenever anything loud plays and
-    // conveys nothing. Averaging one second of samples leaves it well below
-    // full scale and actually moving.
+    // `level` arrives already shaped: ballistics applied, then eased toward
+    // for this frame. GetPeakValue reports transient peaks and on real music
+    // those hit full scale constantly - the phone was measured at 1.0002,
+    // above nominal - so the raw value cannot drive a bar directly.
     //
     // The history strip below keeps the raw per-sample peaks, so the detail is
     // not lost, only moved to where it reads better.
-    let level = average_level(&snap.peak_history, snap.peak);
 
     // --- current level ------------------------------------------------------
     let width = ui.available_width();
@@ -447,17 +494,43 @@ fn meter(ui: &mut egui::Ui, snap: &Snapshot, eps: f32) {
     });
 }
 
-/// Mean of the last second of peak samples, at the 10 Hz tick rate.
+/// Peak history run through fast-attack / slow-release ballistics.
+///
+/// Stateless: it replays the whole retained history each call rather than
+/// keeping a running level. At 150 samples that is free, and it keeps this a
+/// pure function of the snapshot - so it stays testable, and two frames drawn
+/// from the same snapshot cannot disagree.
 ///
 /// Falls back to the instantaneous value before any history exists, so the
 /// meter is not blank for the first tick after launch.
-fn average_level(history: &std::collections::VecDeque<f32>, fallback: f32) -> f32 {
-    const WINDOW: usize = 10;
+fn ballistic_level(history: &std::collections::VecDeque<f32>, fallback: f32) -> f32 {
     if history.is_empty() {
         return fallback;
     }
-    let n = history.len().min(WINDOW);
-    history.iter().rev().take(n).sum::<f32>() / n as f32
+    let mut level = 0.0;
+    for &sample in history {
+        let coeff = if sample > level { ATTACK } else { RELEASE };
+        level += (sample - level) * coeff;
+    }
+    level
+}
+
+/// Ease the drawn level toward the ballistic one, frame-rate independently.
+///
+/// Uses real elapsed time rather than a fixed step per frame, so the bar moves
+/// at the same speed whether the compositor is giving us 60fps or 30.
+fn ease(current: f32, target: f32, last_frame: &mut Option<Instant>) -> f32 {
+    let now = Instant::now();
+    let dt = last_frame
+        .replace(now)
+        .map(|prev| now.saturating_duration_since(prev).as_secs_f32())
+        // A long gap - the window was hidden, or the machine slept. Snapping
+        // is right: easing across it would animate a value nobody was
+        // watching.
+        .filter(|dt| *dt < 0.5)
+        .unwrap_or(1.0);
+
+    current + (target - current) * (1.0 - (-dt / DISPLAY_TAU).exp())
 }
 
 /// The settings panel. Collapsed by default - the meter is what people open
@@ -741,41 +814,88 @@ fn radio_power_banner(ui: &mut egui::Ui, snap: &Snapshot, app: &mut PurpToofApp)
 
 #[cfg(test)]
 mod tests {
-    use super::average_level;
+    use super::ballistic_level;
     use std::collections::VecDeque;
 
     #[test]
     fn an_empty_history_falls_back_to_the_instant_value() {
         // Otherwise the meter is blank for the first tick after launch.
-        assert_eq!(average_level(&VecDeque::new(), 0.42), 0.42);
+        assert_eq!(ballistic_level(&VecDeque::new(), 0.42), 0.42);
     }
 
     #[test]
-    fn transient_peaks_do_not_peg_the_bar() {
-        // The actual complaint: music that touches full scale on transients
-        // pinned the bar at maximum. One full-scale sample among nine quiet
-        // ones must not.
+    fn transient_peaks_are_a_bump_that_falls_away_not_a_peg() {
+        // The original complaint was "music that touches full scale on
+        // transients pinned the bar at maximum". A one-second mean fixed it by
+        // hiding transients entirely, which is what made the bar feel
+        // sluggish. The fix now is decay, not suppression: a transient is
+        // allowed to show, and must then fall back on its own.
         let mut h: VecDeque<f32> = VecDeque::from(vec![0.2; 9]);
         h.push_back(1.0);
-        let level = average_level(&h, 0.0);
-        assert!(level < 0.35, "one transient still dominated: {level}");
+        let spike = ballistic_level(&h, 0.0);
+        assert!(spike > 0.5, "the transient should be visible: {spike}");
+        assert!(spike < 0.85, "but must not reach full scale: {spike}");
+
+        // 600ms of quiet later it is back down near the floor - which is the
+        // half the old averaging got right and must not be lost.
+        for _ in 0..6 {
+            h.push_back(0.2);
+        }
+        let settled = ballistic_level(&h, 0.0);
+        assert!(settled < 0.3, "the bump did not fall away: {settled}");
     }
 
     #[test]
     fn sustained_loudness_still_reads_loud() {
-        // The averaging must not flatten everything - genuinely loud audio
-        // should still fill most of the bar.
+        // Ballistics must not flatten anything - genuinely loud audio should
+        // still fill most of the bar.
         let h: VecDeque<f32> = VecDeque::from(vec![0.9; 10]);
-        assert!(average_level(&h, 0.0) > 0.85);
+        assert!(ballistic_level(&h, 0.0) > 0.85);
     }
 
     #[test]
-    fn only_the_last_second_counts() {
-        // Older samples must age out, or the bar lags far behind the audio.
+    fn the_attack_reaches_most_of_a_step_within_200ms() {
+        // The sluggishness this replaced: a one-second mean needed ten samples
+        // to get here. Two is the whole point.
+        let h: VecDeque<f32> = VecDeque::from(vec![1.0; 2]);
+        let level = ballistic_level(&h, 0.0);
+        assert!(level > 0.85, "attack too slow: {level} after 200ms");
+    }
+
+    #[test]
+    fn stale_samples_decay_away() {
+        // Replaces a test that asserted the level hit exactly 0.0 once the
+        // averaging window had rolled past. Release is exponential, so it
+        // approaches zero rather than reaching it - the assertion has to be a
+        // bound, not an equality.
         let mut h: VecDeque<f32> = VecDeque::from(vec![1.0; 100]);
-        for _ in 0..10 {
+        for _ in 0..6 {
             h.push_back(0.0);
         }
-        assert_eq!(average_level(&h, 0.0), 0.0, "stale samples still counted");
+        let level = ballistic_level(&h, 0.0);
+        assert!(
+            level < 0.15,
+            "600ms of silence should be near zero: {level}"
+        );
+    }
+
+    #[test]
+    fn the_bar_rises_faster_than_it_falls() {
+        // The asymmetry itself, stated directly: a symmetric filter is what
+        // made the meter feel slow, so a regression to one should fail here
+        // rather than only being noticed by eye.
+        let up: VecDeque<f32> = VecDeque::from(vec![1.0; 3]);
+        let rise = ballistic_level(&up, 0.0);
+
+        let mut down: VecDeque<f32> = VecDeque::from(vec![1.0; 50]);
+        for _ in 0..3 {
+            down.push_back(0.0);
+        }
+        let fall = ballistic_level(&down, 0.0);
+
+        assert!(
+            rise > 1.0 - fall,
+            "attack ({rise}) should cover more ground than release ({fall}) does"
+        );
     }
 }
