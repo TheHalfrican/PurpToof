@@ -18,6 +18,37 @@
 //! `PROCESS_QUERY_LIMITED_INFORMATION`, and "svchost" would not be unique if it
 //! were not. The usable key is `GetSessionIdentifier`, which embeds the host
 //! binary path - see [`crate::platform::a2dp_session::looks_like_a2dp_session`].
+//!
+//! # Why ALL matching sessions are held, not the first
+//!
+//! The 2026-09-14 measurement above found exactly one `svchost.exe` session on
+//! the endpoint. That is not guaranteed. Measured again 2026-09-16, with the
+//! phone freshly re-paired and genuinely streaming, there were **two**, both
+//! matching the identifier rule and differing only in their grouping GUID:
+//!
+//! ```text
+//! [2] ...\System32\svchost.exe%b{C55CBD10-423D-4D4F-8D35-C4044AA8EBFC}
+//!       state: Inactive   peak: 0.000000
+//! [7] ...\System32\svchost.exe%b{2A14476C-D8F8-455E-B260-2A2232F486EF}
+//!       state: Active     peak: 1.018684     <- the actual audio
+//! ```
+//!
+//! Binding to the first match therefore bound to the silent twin. Worse, it
+//! stayed bound: `GetPeakValue` on that session *succeeds* and returns `0.0`,
+//! so the "the session died, re-resolve" path never fired. The meter read
+//! `0.0000` for 31 minutes while audio played at full scale, the UI showed
+//! "Connected, silent", and the ladder tore the link down six times.
+//!
+//! So: hold every matching session and report the **maximum** peak across
+//! them, and re-resolve on the interval rather than only when holding
+//! nothing - the streaming session appears *later* than the idle one, so a
+//! set resolved once at startup is stale by the time it matters.
+//!
+//! The max is also the safe direction for the residual ambiguity. If some
+//! other `svchost` session ever carried unrelated audio we would read healthy
+//! flow during genuine A2DP silence, which costs a missed recovery; binding to
+//! the wrong one costs a false "silent" and a reconnect storm, and CLAUDE.md
+//! is explicit that the storm is the worse failure.
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -66,8 +97,9 @@ pub struct MeterReading {
 pub struct WasapiMeter {
     endpoint: IAudioMeterInformation,
     sessions: IAudioSessionManager2,
-    /// The attributed session's meter, once found.
-    attributed: RefCell<Option<IAudioMeterInformation>>,
+    /// Every attributed session's meter. Plural by necessity - see the module
+    /// docs on why the first match is not good enough.
+    attributed: RefCell<Vec<IAudioMeterInformation>>,
     /// Whether we have ever attributed a session on this endpoint. Drives the
     /// difference between `Endpoint` (never knew) and `SessionGone` (knew, lost
     /// it), which is the difference between an honest fallback and a lie.
@@ -102,7 +134,7 @@ impl WasapiMeter {
             Ok(Self {
                 endpoint,
                 sessions,
-                attributed: RefCell::new(None),
+                attributed: RefCell::new(Vec::new()),
                 ever_attributed: Cell::new(false),
                 last_resolve: RefCell::new(None),
             })
@@ -111,16 +143,12 @@ impl WasapiMeter {
 
     /// One reading, with its provenance.
     pub fn read(&self) -> MeterReading {
-        if let Some(peak) = self.read_attributed() {
-            return MeterReading {
-                peak,
-                scope: MeterScope::Session,
-            };
-        }
+        // Refresh first, on the interval. The set is resolved while the phone
+        // is idle and the streaming session only appears once audio starts, so
+        // a set that is never revisited is stale exactly when it matters.
+        self.try_resolve();
 
-        if self.try_resolve()
-            && let Some(peak) = self.read_attributed()
-        {
+        if let Some(peak) = self.read_attributed() {
             return MeterReading {
                 peak,
                 scope: MeterScope::Session,
@@ -141,55 +169,78 @@ impl WasapiMeter {
         }
     }
 
-    /// Read the cached session meter, dropping it if the session has gone.
+    /// The loudest of the attributed session meters.
+    ///
+    /// `None` means we hold nothing readable, which is the caller's cue to
+    /// decide between `Endpoint` and `SessionGone`. The whole set is dropped
+    /// only when *every* meter in it has died, so one stale handle among live
+    /// ones cannot force a spurious re-resolve.
     fn read_attributed(&self) -> Option<f32> {
-        let cached = self.attributed.borrow().clone();
-        let meter = cached?;
-        match unsafe { meter.GetPeakValue() } {
-            Ok(p) => Some(p),
-            Err(_) => {
-                // The session died under us. Drop it so the next call
-                // re-resolves rather than reading a corpse.
-                *self.attributed.borrow_mut() = None;
-                None
+        let held = self.attributed.borrow().clone();
+        let mut loudest: Option<f32> = None;
+        let mut all_dead = !held.is_empty();
+
+        for meter in &held {
+            if let Ok(p) = unsafe { meter.GetPeakValue() } {
+                all_dead = false;
+                loudest = Some(loudest.map_or(p, |best| f32::max(best, p)));
             }
         }
+
+        if all_dead {
+            // Every session died under us. Drop them so the next resolve
+            // rebuilds rather than reading corpses.
+            self.attributed.borrow_mut().clear();
+        }
+        loudest
     }
 
     fn read_endpoint(&self) -> f32 {
         unsafe { self.endpoint.GetPeakValue() }.unwrap_or(0.0)
     }
 
-    /// Hunt for the A2DP session, at most once per [`RESOLVE_INTERVAL`].
+    /// Re-hunt for the A2DP sessions, at most once per [`RESOLVE_INTERVAL`].
     ///
-    /// Returns whether a session is now held.
-    fn try_resolve(&self) -> bool {
+    /// Runs whether or not a set is already held, because the session carrying
+    /// audio appears only once the remote starts streaming - after the idle
+    /// one that is already there.
+    ///
+    /// An enumeration that finds nothing leaves the current set alone rather
+    /// than clearing it. A transient failure must not read as `SessionGone`;
+    /// that determination belongs to [`Self::read_attributed`], which makes it
+    /// from meters that actually refused to answer.
+    fn try_resolve(&self) {
         let now = Instant::now();
         {
             let last = self.last_resolve.borrow();
             if let Some(t) = *last
                 && now.duration_since(t) < RESOLVE_INTERVAL
             {
-                return false;
+                return;
             }
         }
         *self.last_resolve.borrow_mut() = Some(now);
 
-        let Some(meter) = (unsafe { self.find_a2dp_session() }) else {
-            return false;
-        };
-        *self.attributed.borrow_mut() = Some(meter);
+        let found = unsafe { self.find_a2dp_sessions() };
+        if found.is_empty() {
+            return;
+        }
         self.ever_attributed.set(true);
-        true
+        *self.attributed.borrow_mut() = found;
     }
 
     /// # Safety
     ///
     /// Caller must be on a COM-initialized thread.
-    unsafe fn find_a2dp_session(&self) -> Option<IAudioMeterInformation> {
+    unsafe fn find_a2dp_sessions(&self) -> Vec<IAudioMeterInformation> {
+        let mut found = Vec::new();
         unsafe {
-            let enumerator = self.sessions.GetSessionEnumerator().ok()?;
-            let count = enumerator.GetCount().ok()?;
+            let Ok(enumerator) = self.sessions.GetSessionEnumerator() else {
+                return found;
+            };
+            let Ok(count) = enumerator.GetCount() else {
+                return found;
+            };
             for i in 0..count {
                 let Ok(control) = enumerator.GetSession(i) else {
                     continue;
@@ -200,11 +251,11 @@ impl WasapiMeter {
                 if looks_like_a2dp_session(&session_identifier(&control2))
                     && let Ok(meter) = control.cast::<IAudioMeterInformation>()
                 {
-                    return Some(meter);
+                    found.push(meter);
                 }
             }
-            None
         }
+        found
     }
 }
 
