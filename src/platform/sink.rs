@@ -162,7 +162,11 @@ impl Sink {
                 windows::core::IInspectable,
             >::new(|sender, _| {
                 if let Some(s) = sender.as_ref() {
-                    tracing::debug!(state = ?s.State(), "AudioPlaybackConnection StateChanged");
+                    // `info`, not `debug`: the default filter is `info`, so
+                    // this - the only record of the link opening and closing -
+                    // was being written nowhere. docs/verify.md flagged that
+                    // as an open observability gap and it stayed open.
+                    tracing::info!(state = ?s.State(), "link StateChanged");
                 }
                 Ok(())
             }))

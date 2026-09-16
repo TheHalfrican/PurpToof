@@ -35,7 +35,9 @@ use anyhow::{Context, Result, anyhow};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
 use crate::core::power::RadioPowerPolicy;
-use crate::core::{Action, Config, HealthStatus, Supervisor, SystemClock, Tick, Trigger};
+use crate::core::{
+    Action, Config, HealthStatus, RecoveryOutcome, Supervisor, SystemClock, Tick, Trigger,
+};
 use crate::platform::meter::MeterScope;
 use crate::platform::radio_power;
 use crate::platform::triggers::{DefaultDeviceWatch, Triggers};
@@ -333,6 +335,15 @@ fn worker_main(
     let silence_eps = sup.config().silence_eps;
     let mut silent_since: Option<Instant> = Some(Instant::now());
 
+    // Previous values, so the rolling file records *transitions* rather than
+    // the same line ten times a second. The reconnect log is in memory and
+    // dies with the process; these lines are what survive a restart, which is
+    // the difference between "it healed itself twice overnight" and "it has
+    // been broken for an hour". Four restarts during one outage erased every
+    // trace of it, which is what prompted this.
+    let mut last_status: Option<HealthStatus> = None;
+    let mut last_outcome: Option<RecoveryOutcome> = None;
+
     while let ControlFlow::Continue = drain_commands(&commands, &mut sup) {
         // Polled rather than event-driven; see DefaultDeviceWatch. Checked
         // before the tick so a change is acted on this pass rather than next.
@@ -355,8 +366,31 @@ fn worker_main(
             silent_since = Some(Instant::now());
         }
 
+        let status = sup.status();
+        if last_status != Some(status) {
+            // The peak and its provenance ride along because "ConnectedSilent"
+            // means something very different depending on whether the meter
+            // was reading the A2DP session or falling back to the endpoint.
+            tracing::info!(
+                ?status,
+                peak = reading.peak,
+                scope = ?reading.scope,
+                "status changed"
+            );
+            last_status = Some(status);
+        }
+
+        if let Tick::Resolved(outcome) = tick
+            && last_outcome != Some(outcome)
+        {
+            // NoRemote is the steady state with the phone away and repeats
+            // forever, so only the transition is worth a line.
+            tracing::info!(?outcome, "open resolved");
+            last_outcome = Some(outcome);
+        }
+
         if let Ok(mut s) = shared.lock() {
-            s.status = sup.status();
+            s.status = status;
             s.peak = reading.peak;
             s.scope = reading.scope;
             s.silent_for = silent_since.map(|t| t.elapsed());
@@ -417,6 +451,11 @@ where
 }
 
 fn push_log(log: &mut Vec<LogEntry>, action: Action) {
+    // Both, deliberately. The in-memory copy is what the window renders; the
+    // tracing line is the only part that outlives the process, and a recovery
+    // nobody can see the morning after may as well not have been recorded.
+    tracing::info!(?action, "recovery");
+
     log.push(LogEntry {
         at: SystemTime::now(),
         reason: format!("{action:?}"),
