@@ -99,6 +99,9 @@ fn startup() -> (Config, Paths, Option<logging::LogGuard>) {
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        // The version alone matches every build between two releases,
+        // including ones with bugs the later ones fixed. See build.rs.
+        build = env!("PURPTOOF_BUILD"),
         mode = ?paths.mode,
         config = %paths.config.display(),
         "PurpToof starting"
@@ -162,7 +165,11 @@ fn gui() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("purptoof {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "purptoof {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("PURPTOOF_BUILD")
+    );
     println!();
     println!("  (no flags)         the app");
     println!("  --debug-sessions   dump WASAPI sessions and GSMTC state (read-only)");
