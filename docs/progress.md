@@ -23,8 +23,9 @@ state. If they disagree, this file is newer.
 | 7 | Re-arm triggers | **done** — 3 event-driven + 1 polled, 3/3 registered on hardware |
 | 8 | egui UI + tray | **done** — window, tray, close-to-tray |
 | 9 | Config, autostart, logging | **done** — TOML, rolling daily log, Run key, settings panel |
-| 10 | Overnight soak → `docs/soak.md` | **the only thing left** |
+| 10 | Overnight soak → `docs/soak.md` | **still outstanding** |
 | + | Packaging: release build, NSIS + MSI | **done** — both verified install/uninstall |
+| + | 2026-09-16 field fixes | **done** — see below; Signal A was returning wrong values |
 
 ### The one settled decision that gates everything
 
@@ -34,6 +35,51 @@ exe: class activation, enumeration, `TryCreateFromId`, `Start()`, and `Open()`
 returning `Success`. There is no packaging work in this project. Evidence and
 the API corrections are in `docs/verify.md` — **read that file before touching
 `platform/`**, it records three ways the CLAUDE.md lifecycle sketch was wrong.
+
+---
+
+## 2026-09-16 — what the first real field failure changed
+
+Two faults in one evening, one hiding the other. Full evidence in
+`docs/verify.md`; these are the parts that change what to do next.
+
+1. **The meter was reporting silence during full-scale audio, for 31 minutes,
+   and tore a working link down six times.** A re-pair mints a *new* `svchost`
+   render session and the old one lingers, `Inactive` and permanently silent.
+   Both match the identifier rule; `find_a2dp_session` took the first and never
+   re-resolved, because `GetPeakValue` on a dead-but-present session succeeds
+   and returns `0.0`. Signal A — the observation the whole app decides on — was
+   wrong. Fixed: hold every match, report the max, re-resolve on the interval.
+
+2. **A stale classic BR/EDR bond looks exactly like an absent phone.** The
+   phone was in range with its LE bond up and its classic bond dead; the app
+   said "Waiting for a device" for a day. `Open()` returns `ERROR_GEN_FAILURE`
+   for both, and `platform/sink.rs` maps it to `Unreachable` → `NoRemote`. That
+   mapping was only ever measured with the phone's radio **off**.
+
+3. **Signal B is definitively absent on this hardware**, now measured with a
+   freshly re-paired phone actively streaming. The watchdog is therefore inert
+   for the fault it exists to catch — see `docs/verify.md`. This is the most
+   important open problem in the project.
+
+4. **The logs said nothing**, because the reconnect log was memory-only and
+   `StateChanged` was at `debug` under an `info` filter. Six restarts during
+   the outage erased the evidence six times. Now fixed, and the binary carries
+   its commit so two builds can be told apart.
+
+### A rule that was written and deliberately removed
+
+A `HealthStatus::BondSuspect` — "LE up, classic down for 120s, so the pairing
+is stale" — was built, tested and taken back out before it could reach a user.
+`(Closed, LE up, classic down)` is most likely the *normal idle state*: this
+repo already records that iOS drops the route during an idle gap
+(`verify.md:220`) and that the link closes ~10s after audio stops
+(`verify.md:453`). It would have accused the user's pairing daily.
+
+`Presence` survives as an **observation only**, guarded by
+`presence_never_changes_a_decision`. The lesson is in the commit message for
+`56671c3`: the app has no concept of *demand*, and idle and underrun cannot be
+told apart without one.
 
 ---
 
@@ -243,9 +289,27 @@ what CLAUDE.md's Repository section describes; do not "fix" it.
 
 ## Open questions for Noah
 
-1. **Does the A2DP session identifier survive a reconnect?** One `--watch` run
-   spanning a disconnect and reconnect would answer it. Not blocking —
-   `looks_like_a2dp_session` deliberately does not depend on the GUID.
-2. **Radio selective suspend** on the Intel adapter has still never been read.
-   Low priority, but it explains a class of failures the watchdog can only
-   paper over.
+Both of the questions that stood here are now answered:
+
+- ~~Does the A2DP session identifier survive a reconnect?~~ **No.** The
+  grouping GUID changed across a re-pair and the old session lingered, which is
+  what caused the meter fault above. `looks_like_a2dp_session` still does not
+  depend on the GUID, which is why the rule survived — but it matches more than
+  one session, which is what did not.
+- ~~Radio selective suspend has never been read.~~ **Read, and it was on.** Now
+  off, and `--debug-sessions` reports it as layer 0 with a one-click fix in the
+  window.
+
+What is open now:
+
+1. **Is `(link Closed, LE up, classic down)` the normal idle state?** This
+   decides whether any stale-bond rule is possible at all. Answered by building
+   the presence reader, logging `(link, classic, le, Open() outcome)` and
+   acting on none of it, then leaving it running for an ordinary day.
+2. **Should Reconnect be diagnostic?** With Signal B absent, a button press is
+   the only unambiguous "I want audio now" the PC ever gets. Making it report
+   which layer failed would turn a day-long mystery into a five-second answer.
+   Arguably the highest-value remaining work — and arguably scope creep, since
+   CLAUDE.md calls feature expansion a non-goal. Noah's call.
+3. **What actually broke the link key on 2026-09-15?** Still open, and may stay
+   that way. Selective suspend is a correlation, not a demonstrated cause.

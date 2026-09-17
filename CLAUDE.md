@@ -94,13 +94,21 @@ Two independent observations, cross-checked. Audio is considered dead when **the
 
 Prefer the *session*-scoped meter if the A2DP render session is attributable: `IAudioSessionManager2::GetSessionEnumerator` -> `IAudioSessionControl2::GetProcessId` -> QI for `IAudioMeterInformation`.
 
-**VERIFY:** the internally-rendered A2DP audio may not appear as a session owned by our PID — Windows may render it from the audio engine or a system process. Enumerate sessions while streaming and find out where it actually lands. If it is not attributable, fall back to the endpoint-level meter and lean harder on Signal B to avoid false positives from other apps' audio.
+**RESOLVED 2026-09-14, amended 2026-09-16.** It *is* attributable, and not to our PID: A2DP render audio lands on a protected `svchost.exe`, so the session identifier — which embeds the host binary path — is the usable key, not the PID. Session-scoped Signal A is therefore viable.
+
+**With one correction that cost 31 minutes of false silence:** there can be more than one matching `svchost` session. A re-pair mints a new render session and the old one lingers, `Inactive` and permanently silent, matching the same rule. Hold **every** match and report the max; binding to the first bound to the corpse, and `GetPeakValue` on it *succeeds* with `0.0`, so nothing ever re-resolved. See `docs/verify.md`.
 
 ### Signal B — does the remote think it is playing
 
 `GlobalSystemMediaTransportControlsSessionManager::RequestAsync()` -> find the session corresponding to the connected device -> `GetPlaybackInfo().PlaybackStatus`.
 
-When the PC is the A2DP sink, the phone should surface as a GSMTC session via AVRCP. **VERIFY** this holds for the target phone; some devices publish no AVRCP metadata. If Signal B is unavailable, degrade gracefully: fall back to a longer silence timeout plus an explicit user-triggered reconnect, and say so in the UI. Do not silently reconnect on Signal A alone — that will thrash during genuine quiet passages.
+When the PC is the A2DP sink, the phone should surface as a GSMTC session via AVRCP.
+
+**RESOLVED 2026-09-16: it does not.** Measured with a freshly re-paired phone actively streaming — the cleanest conditions available — GSMTC reported only a local browser. This iPhone publishes no AVRCP metadata, so **Signal B is permanently unavailable on this hardware.**
+
+The app degrades as designed: longer silence timeout, explicit user-triggered reconnect, and it says so in the UI. It does not reconnect on Signal A alone, which would thrash during quiet passages.
+
+**But read the consequence, because it is severe.** With no Signal B and `recover_without_remote_signal = false`, `Recover(SilentWhilePlaying)` is *unreachable* — so the watchdog described below as "the core of the app" cannot fire for the fault it was written to catch. The remaining automatic path needs failed opens on a **closed** link, and the real fault presents as one that is **open**. Flipping the flag is not a fix: every pause past the degraded timeout would tear the link down, and a teardown makes iOS drop the route. This is the most important open problem in the project.
 
 ### Decision rule
 
@@ -154,7 +162,11 @@ Debounce all four — resume in particular fires a burst of overlapping events. 
 
 Bluetooth adapters (especially USB dongles) default to "allow the computer to turn off this device to save power," which produces exactly this symptom class.
 
-The app should not silently rewrite this. **Detect and warn**: read the adapter's power-management state via SetupAPI device properties and show a one-line banner with a "how to fix" link when selective suspend is enabled. Optional, low priority, but it will explain a class of failures the watchdog can only paper over.
+The app should not silently rewrite this. **Detect and warn.**
+
+**DONE 2026-09-16.** Read from the registry rather than SetupAPI: unticking the box writes `IdleInWorkingState = 0` under the devnode's `Device Parameters\WDF`, and a `REG_DWORD` read is something `platform/` can do in a dozen lines and get right. Reported as layer 0 by `--debug-sessions`, and surfaced in the window as a banner that names the exact change before a one-click fix applies it through an elevated helper — so the app never holds an elevated token and nothing happens without the user asking. An absent value reads as `Unknown` and warns about nothing.
+
+It was enabled on the target machine, and has been turned off. Whether it caused anything remains **unproven**.
 
 ## UI
 
@@ -246,7 +258,7 @@ Every one ends in `Streaming` with zero manual steps. Record results in `docs/so
 
 ### Tooling
 
-`cargo nextest run`, `cargo clippy -- -D warnings`, `cargo fmt --check` in CI on `windows-latest`. Ship a `--debug-sessions` flag that dumps the WASAPI session list and GSMTC sessions, for the two VERIFY items above.
+`cargo nextest run`, `cargo clippy -- -D warnings`, `cargo fmt --check` in CI on `windows-latest`. Ship a `--debug-sessions` flag that dumps the WASAPI session list and GSMTC sessions, for the two VERIFY items above. (Both resolved 2026-09-16; the tool stays, because it is how any future "Windows says connected and the phone disagrees" gets answered.)
 
 ## Non-goals
 
@@ -260,16 +272,32 @@ Every one ends in `Streaming` with zero manual steps. Record results in `docs/so
 
 1. ~~Repo on Gitea, GitHub mirror remote, CI skeleton green on an empty crate~~ **DONE**
 2. ~~Packaging spike (unpackaged vs sparse MSIX) — gates everything~~ **DONE — unpackaged wins, no MSIX**
-3. Bare connect + render, no UI, confirm audio flows — *partly done: the spike
-   opens a real stream and reaches `Opened`. Audible confirmation outstanding.*
-4. ~~`--debug-sessions`~~ **DONE** and resolve both VERIFY items — *the tool
-   ships and reports all four layers; both VERIFY items still need one run
-   while the phone is actually streaming. See `docs/verify.md`.*
+3. ~~Bare connect + render, no UI, confirm audio flows~~ **DONE** — audible
+   out of the PC's speakers, 2026-09-14.
+4. ~~`--debug-sessions` and resolve both VERIFY items~~ **DONE** — the tool
+   reports five layers now, and both VERIFY items are resolved as of
+   2026-09-16. Signal A is attributable; Signal B is absent on this hardware,
+   permanently. See `docs/verify.md`.
 5. ~~`core/` traits + `FakeConnection` + health state machine, test-first~~
    **DONE** — 57 tests, ratio 2.5:1, `FakeConnection` reproduces the
    `Opened`-while-silent bug deterministically
-6. `platform/` impls behind those traits, `recover()` wired up
-7. Re-arm triggers
-8. egui UI and tray
-9. Config, autostart, logging
-10. Overnight soak, record in `docs/soak.md`
+6. ~~`platform/` impls behind those traits, `recover()` wired up~~ **DONE**
+7. ~~Re-arm triggers~~ **DONE** — 3 event-driven + 1 polled, 3/3 registered
+8. ~~egui UI and tray~~ **DONE**
+9. ~~Config, autostart, logging~~ **DONE** — and logging made *durable*
+   2026-09-16; before that the file recorded nothing but process starts, and
+   six restarts during an outage erased the evidence six times over.
+10. Overnight soak, record in `docs/soak.md` — **still outstanding**
+
+Added after the first real field failure, 2026-09-16:
+
+11. **Presence reader, wired to logging and to nothing else.** Log
+    `(link, classic, le, Open() outcome)` and act on none of it, then leave it
+    running for an ordinary day. That measurement decides whether a stale-bond
+    rule is possible at all — a first attempt at one was written and removed
+    because it would most likely have fired on the normal idle state. See
+    commit `56671c3`.
+12. **Consider making Reconnect diagnostic.** With Signal B absent, a button
+    press is the only unambiguous "I want audio now" this PC ever receives.
+    Having it report which layer failed would turn a day-long mystery into a
+    five-second answer. Weigh against the non-goal on feature expansion.

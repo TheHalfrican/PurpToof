@@ -801,3 +801,163 @@ with the link open; nothing in the log marks a transition, because
 `StateChanged` is logged at `debug` and the default filter is `info`. That is an
 observability gap worth closing before the soak - if this happens overnight, the
 log as it stands will not say when or why.
+
+---
+
+# 2026-09-16 — two faults, one hiding the other
+
+Reported as "PurpToof just stopped working", then refined to: the PC shows as
+connected to the phone, but the phone offers no option to send audio to it.
+
+Two independent faults. The first explains the reported symptom; the second had
+been hiding underneath it and is the more serious of the two.
+
+## Fault 1: the classic BR/EDR bond went stale
+
+A phone pairs **twice**, over two independent bonds with separate link keys,
+and only the classic BR/EDR one carries A2DP. State at the time:
+
+| bond | address | connected |
+|---|---|---|
+| LE | `5b:95:56:a6:f7:ec` | **true** |
+| classic BR/EDR | `64:48:42:67:0b:f4` | **false** |
+
+Windows Settings showed "Connected" off the LE half while no audio path could
+exist. The phone offered no audio route because, with no authenticated classic
+link, there was no A2DP service for it to offer.
+
+System log, provider `BTHUSB`, exactly two events in fourteen days:
+
+```text
+2026-09-15 16:16:26  Id 16  mutual authentication ... (64:48:42:67:0b:f4) failed
+2026-09-15 16:17:09  Id 16  mutual authentication ... (64:48:42:67:0b:f4) failed
+```
+
+Remedy: forget the device on **both** ends and pair again. Confirmed working.
+The re-pair is visible in the same log and independently confirms the two-bond
+structure — two keys removed in the same second, re-minted separately a minute
+later, the LE half under a fresh resolvable private address:
+
+```text
+2026-09-16 18:33:12  Id 10  link key removed  64:48:42:67:0b:f4   classic
+2026-09-16 18:33:12  Id 10  link key removed  5b:95:56:a6:f7:ec   LE
+2026-09-16 18:34:51  Id  8  paired            64:48:42:67:0b:f4   classic
+2026-09-16 18:34:52  Id  8  paired            76:cf:be:13:df:ad   LE, new RPA
+```
+
+### What caused the authentication failure is STILL OPEN
+
+Only two events, 43s apart, and then none across eight hours during which the
+app retried every few seconds — so every later attempt failed *before*
+authentication was reached. That is consistent with several stories and settles
+none of them. Do not record this as explained.
+
+The adapter had "allow the computer to turn off this device to save power"
+enabled, which CLAUDE.md names as a cause of this symptom class. **That is a
+correlation, not a demonstrated cause.** It has since been turned off.
+
+### The app was not at fault, but it could not say anything either
+
+PurpToof was advertising correctly and showed "Waiting for a device" throughout
+— technically true, useless in practice. `Open()` fails with
+`ERROR_GEN_FAILURE` in this state, which `platform/sink.rs` maps to
+`Unreachable` → `NoRemote`, the same as a phone in another room. That mapping
+was only ever measured with the phone's radio **off**. It folds "the bond is
+dead and the phone is right here" into "the phone is elsewhere", and those must
+not look the same.
+
+## Fault 2: the meter was reporting silence during full-scale audio
+
+Found while verifying the re-pair. With audio demonstrably playing:
+
+| what | value |
+|---|---|
+| endpoint peak | `0.866257` |
+| A2DP session peak | `0.865891` |
+| **what the app displayed** | **`0.0000`, "Connected, silent"** |
+| how long it had said so | 31 minutes |
+| recoveries it performed | 6, ladder climbing 5s → 5s → 5s → 10s → 30s |
+
+It had been tearing down a working link for half an hour on the strength of a
+false silence reading. Signal A — the observation this entire app decides on —
+was wrong.
+
+### RESOLVED: the grouping GUID is NOT stable across a re-pair
+
+`platform/a2dp_session.rs` recorded the A2DP session identifier's trailing GUID
+as "byte-identical across every sample", while explicitly noting its stability
+across a reconnect was unestablished. It is now established. It changed, and
+the old session **lingers**:
+
+```text
+2026-09-14   svchost %b{C55CBD10-...}   Active     0.443092   carried audio
+2026-09-16   svchost %b{C55CBD10-...}   Inactive   0.000000   stale, still present
+             svchost %b{2A14476C-...}   Active     0.865891   carries audio now
+```
+
+Both match the `\system32\svchost.exe` identifier rule. `find_a2dp_session`
+returned the **first** match, bound to the silent twin, and then never
+re-resolved — `GetPeakValue` on a dead-but-present session *succeeds* and
+returns `0.0`, so the "the session died, go and find another" path could never
+fire.
+
+The 2026-09-14 run that set the rule saw exactly one `svchost` session, so
+first-match was indistinguishable from correct.
+
+Fixed: hold **every** matching session, report the max, and re-resolve on the
+interval rather than only when holding nothing — the streaming session appears
+*after* the idle one, so a set resolved once at startup is stale exactly when
+it starts to matter.
+
+## RESOLVED: CLAUDE.md VERIFY item 1 — Signal A attribution
+
+A2DP render audio **is** attributable to a session, and it is not ours. It
+lands on a protected `svchost.exe` (pid 4312), which is why the session
+identifier and not the PID is the usable key. Session-scoped Signal A is
+therefore viable — with the plural correction above.
+
+## RESOLVED: CLAUDE.md VERIFY item 2 — Signal B is absent, definitively
+
+Measured with a **freshly re-paired** phone **actively streaming** to the PC —
+the cleanest conditions this has ever been tested under. GSMTC reported one
+session, a local browser. Nothing from the phone.
+
+This is now settled rather than assumed: this iPhone publishes no AVRCP
+metadata to GSMTC, so Signal B is permanently unavailable on this hardware.
+
+### Consequence: the watchdog is inert here
+
+With `remote == None` and `recover_without_remote_signal = false`,
+`expect_audio` is false, so `playing_silent_since` is never set, `fault` is
+never true, and `Recover(SilentWhilePlaying)` is **unreachable**. The only
+automatic recovery left is `ReArmExhausted`, which needs repeated *failed*
+opens on a **closed** link — and the real fault presents as a link that is
+**open**.
+
+So on this hardware the mechanism CLAUDE.md calls "the core of the app" cannot
+fire for the fault it was written to catch. Flipping
+`recover_without_remote_signal` is not a fix: every pause past the degraded
+timeout would tear the link down, and a teardown makes iOS drop the route.
+
+## CORRECTION: `State()` is not scoped to your own connection object
+
+`--debug-sessions` layer 2 asserted that `AudioPlaybackConnectionState`
+"reflects only the connection object *we* hold" and that `Closed` was expected
+for an object we had not opened. **That is wrong.**
+
+Measured: a connection constructed by the diagnostic and never opened read
+`Opened`, while a separate PurpToof process held the link. So `Opened` means
+*someone* has the device open and `Closed` means nobody does — neither is a
+statement about your own object. The note has been corrected.
+
+## Closed: the observability gap flagged above
+
+The previous section ended by noting that `StateChanged` was logged at `debug`
+under an `info` filter, so a link transition overnight would leave no trace,
+and calling that "worth closing before the soak". It stayed open, and then cost
+a night: the app was restarted six times during the outage and the reconnect
+log lived only in memory, so each restart erased the previous run's evidence.
+
+Now at `info`, along with recoveries, status transitions and open outcomes. The
+binary also carries its commit (`PURPTOOF_BUILD`), because `version="0.2.0"`
+matched both the build with the meter bug and the build that fixed it.
