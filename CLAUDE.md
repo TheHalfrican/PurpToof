@@ -263,6 +263,16 @@ Every one ends in `Streaming` with zero manual steps. Record results in `docs/so
 ## Non-goals
 
 - Output device selection, DSP, multi-output routing (that is Lockstep's territory — if it is ever wanted, feed a virtual endpoint and let Lockstep take it from there)
+- **Volume boost past 100%. Asked for 2026-09-21, measured, and closed as
+  impossible here — do not re-open it without reading `docs/verify.md`.**
+  Every Windows volume API stops at unity (the endpoint reports its own
+  range as `-96.0 dB .. 0.0 dB`), so boosting means owning the PCM.
+  Process loopback *activates* against the protected A2DP `svchost` but
+  delivers an all-zero timeline — proven against a known-amplitude tone
+  that captured correctly in the same run. Classic endpoint loopback does
+  capture the samples, but only mixed with every other app, which cannot
+  support a targeted boost. What remains is an APO or a virtual audio
+  device; both are signed drivers, and both are the bullet above.
 - LDAC/aptX or any codec control
 - Latency tuning
 - Being an AVRCP controller beyond reading playback state

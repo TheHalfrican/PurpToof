@@ -961,3 +961,159 @@ log lived only in memory, so each restart erased the previous run's evidence.
 Now at `info`, along with recoveries, status transitions and open outcomes. The
 binary also carries its commit (`PURPTOOF_BUILD`), because `version="0.2.0"`
 matched both the build with the meter bug and the build that fixed it.
+
+# 2026-09-21 — volume boost: can PurpToof make audio louder than the phone sends it?
+
+Asked as a feature request ("a slider that goes past 100%"). Measured with
+`src/bin/spike-boost.rs` against a live, actively streaming phone.
+
+## RESOLVED: no Windows volume API can boost, and Windows says so itself
+
+`spike-boost` prints the endpoint's own declared range:
+
+```text
+master volume      : 100.0%
+volume range       : -96.0 dB .. 0.0 dB (step 1.50)
+```
+
+Maximum 0.0 dB. Unity is the ceiling, by definition — `IAudioEndpointVolume`
+attenuates and nothing more, and `ISimpleAudioVolume` is clamped to
+`[0.0, 1.0]`. **A slider bound to either cannot exceed 100%.** Going past unity
+means multiplying PCM samples, which needs the samples.
+
+## RESOLVED: there is no slack on the PC side to reclaim
+
+Both stages were already at unity with the phone streaming:
+
+```text
+[0] pid 4560 (Active)
+    session volume : 100.0%  muted=false
+    peak           : 0.1987
+```
+
+So the quietness is **not** a PurpToof or Windows setting. Peaks over several
+runs ranged 0.0023–0.2485, i.e. roughly −52 to −12 dBFS arriving. The
+attenuation is upstream, on the phone. The one action that recovers real
+headroom here is raising the iPhone's own volume — no DSP involved.
+
+## RESOLVED: process loopback ACTIVATES against the protected svchost
+
+This was the gate. A2DP render lands on a protected service host, and the
+concern was that per-process capture would be refused there.
+
+It is not. `AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS.TargetProcessId` is a raw
+`u32` and needs no process handle — which matters, because `GetProcessId`
+works on that session while `OpenProcess` does not.
+
+```text
+=== question 2: process loopback INCLUDE pid 4560 ===
+  activation         : OK
+```
+
+`ActivateAudioInterfaceAsync` succeeded, `Initialize`, `GetService` and
+`Start` all succeeded, and packets arrived at a clean 48 kHz.
+
+## FINDING: ...and it delivers nothing but digital silence
+
+Activation succeeding is not the same as capturing anything. Over 1200
+packets / 576000 frames, the captured peak was **exactly 0.0000**, while the
+A2DP session meter read non-zero *in the same second*:
+
+```text
+packets=101  silent=0   captured=0.0000  session_meter=0.0494
+packets=100  silent=0   captured=0.0000  session_meter=0.0176
+```
+
+Note `silent=0` — the engine never set `AUDCLNT_BUFFERFLAGS_SILENT`. It hands
+out a continuous, well-formed, all-zero timeline.
+
+`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` against our own pid — which
+should capture *everything else on the machine* — was equally silent.
+
+### The control that made this conclusive, and why the first one was worthless
+
+Comparing a captured peak against a session meter read at a different moment
+proves nothing; the music may simply have been quiet. Two things were needed:
+
+1. Read the session meter **in the same second** as the captured peak.
+2. Put a known signal through an **ordinary** process, because "A2DP is
+   invisible" and "our capture code is broken" look identical when A2DP is the
+   only thing playing. The first EXCLUDE run had this flaw and was discarded.
+
+A 440 Hz tone at exactly 0.08 full scale, played by a separate `pwsh` process:
+
+```text
+packets=100  silent=0   captured=0.0800  session_meter=0.0535
+packets=101  silent=0   captured=0.0800  session_meter=0.0927
+```
+
+`captured=0.0800` is the generated amplitude to four decimals, so the capture
+path is **correct**. And it captured *only* the tone while the session meter
+simultaneously tracked A2DP audio varying underneath it.
+
+**Conclusion: A2DP render audio is excluded from process loopback capture in
+both INCLUDE and EXCLUDE modes, while remaining present on the endpoint and
+correctly metered by WASAPI.** Most likely the stream is marked non-capturable,
+the same mechanism that protects DRM audio. Whatever the cause, the samples are
+withheld rather than merely unattributable.
+
+## RESOLVED: classic endpoint loopback DOES capture it
+
+A different mechanism — `AUDCLNT_STREAMFLAGS_LOOPBACK` on the endpoint's own
+`IAudioClient`, tapping the final mix rather than filtering per stream:
+
+```text
+mix format         : 2 ch, 48000 Hz, 32 bit (tag 65534)
+packets=100  captured=0.2485   session_meter=0.2484
+```
+
+Exact agreement to four decimals. **The PCM is obtainable.** What is not
+obtainable is the PCM *in isolation*.
+
+### Why that does not rescue the feature
+
+A targeted boost needs two things at once: the A2DP samples alone, and the
+original A2DP stream silenced so it is not heard twice. Endpoint loopback gives
+neither.
+
+- It captures the whole mix, so boosting it boosts the browser and every game.
+- Rendering the boosted result back to the same endpoint feeds our own output
+  into the next capture — a runaway loop. The fix for that is precisely
+  `EXCLUDE_TARGET_PROCESS_TREE` on our own pid, which is process loopback,
+  which cannot see A2DP.
+- Muting the A2DP session to avoid double audio also removes it from the very
+  mix being captured.
+
+There is no ordering of these that works on the default endpoint.
+
+## Verdict
+
+**Volume boost past 100% is not constructible inside PurpToof.** The remaining
+routes are a system-effects APO (signed driver package, INF-installed,
+system-wide) or a virtual audio device (a driver). Both are drivers, and
+CLAUDE.md's non-goals already rule them out — and, notably, already name the
+answer: *"if it is ever wanted, feed a virtual endpoint and let Lockstep take it
+from there."* Volume boost belongs in Lockstep.
+
+## FINDING: this does NOT rescue the watchdog either
+
+Worth recording, because the hope was that captured packet arrival could supply
+the discriminator that absent Signal B cannot — "frames arriving but silent"
+(paused) versus "no frames arriving" (dead path).
+
+It cannot. Process loopback emits a continuous 48 kHz timeline whether or not
+the target renders anything, with `AUDCLNT_BUFFERFLAGS_SILENT` never set, so
+packet arrival carries no information about A2DP at all. Endpoint loopback
+sees the samples but cannot attribute them, which is strictly worse than the
+session meter already in `platform/meter.rs`.
+
+**The most important open problem in the project stays open.**
+
+## Not run: does muting the A2DP session kill its meter?
+
+`--mute-probe` was built to answer whether muting the A2DP session zeroes its
+peak meter — the risk being that the boost pipeline would destroy Signal A,
+the only health signal left. It was **deliberately not run**: with the boost
+pipeline dead, nothing needs to mute that session, and the probe silences a
+working phone for a question nobody is asking any more. The mode stays in the
+spike in case a future design needs it.

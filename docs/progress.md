@@ -3,7 +3,7 @@
 Resume point for a new session. `CLAUDE.md` is the design; this file is the
 state. If they disagree, this file is newer.
 
-**Last updated:** 2026-09-15, v0.2.0
+**Last updated:** 2026-09-21, v0.2.0
 **CI:** green on `windows-latest` (fmt, clippy `-D warnings`, build, nextest, ratio gate)
 **Tests:** 126 passing, ~0.2s, core still all on a fake clock
 **Ratio gate:** passing on `src/core/` against a 0.9 floor
@@ -82,6 +82,52 @@ repo already records that iOS drops the route during an idle gap
 told apart without one.
 
 ---
+
+## 2026-09-21 — volume boost: asked, measured, closed
+
+A "Volume Boost" feature was requested: a slider that goes past 100%. It was
+spiked the same day and **closed as not constructible inside PurpToof.** Full
+evidence in `docs/verify.md`; `src/bin/spike-boost.rs` reproduces all of it.
+
+The short chain:
+
+1. Windows states its own ceiling — the endpoint reports
+   `volume range: -96.0 dB .. 0.0 dB`. Unity is the maximum, so no volume API
+   can boost, and past unity means owning the PCM.
+2. There is no slack to reclaim anyway: endpoint master and A2DP session
+   volume were both already at 100%, unmuted, while the phone streamed.
+3. Process loopback **activates** against the protected A2DP `svchost` — the
+   risk that was expected to kill it did not — but delivers exactly 0.0000
+   across 1200 packets while the session meter reads non-zero in the same
+   second. A 440 Hz tone at 0.08 full scale from an ordinary process was
+   captured as `0.0800` in that same run, so the capture path is correct and
+   the A2DP samples are deliberately withheld.
+4. Classic endpoint loopback **does** capture them (`0.2485` against a session
+   meter of `0.2484`) — but only mixed with every other application, which
+   cannot support a targeted boost.
+
+What remains is an APO or a virtual audio device. Both are signed drivers and
+both are already non-goals. **If this is ever wanted it belongs in Lockstep**,
+exactly as CLAUDE.md always said — fed from a virtual endpoint. Noah's call on
+2026-09-21 was to leave it there and not touch Lockstep.
+
+### Two things worth carrying forward
+
+- **The audio really is quiet, and the cause is the phone.** Peaks arrived at
+  roughly −52 to −12 dBFS with the PC at unity end to end. The only lever that
+  recovers headroom here is the iPhone's own volume on the Bluetooth route.
+  A UI "headroom readout" naming where the loss is was offered and declined for
+  now; it remains the in-scope half of this request if it ever comes back.
+- **This does not rescue the watchdog.** Process loopback emits a continuous
+  48 kHz timeline with `AUDCLNT_BUFFERFLAGS_SILENT` never set, whether or not
+  A2DP is flowing, so packet arrival cannot discriminate "paused" from "dead
+  path". Endpoint loopback sees samples but cannot attribute them, which is
+  strictly worse than `platform/meter.rs` today. The most important open
+  problem in the project is still open.
+
+`--mute-probe` in the spike was built but **deliberately never run**: it
+silences a working phone to ask whether muting kills Signal A, and with the
+boost pipeline dead nothing needs to mute that session.
 
 ## Do this next
 
@@ -262,6 +308,10 @@ pwsh -File scripts/check-test-ratio.ps1     # the 0.9:1 gate on core/
 
 cargo run --bin purptoof -- --debug-sessions   # read-only, safe any time
 cargo run --bin purptoof -- --watch=120         # read-only, one line per second
+cargo run --bin spike-boost                    # read-only: where is the audio attenuated?
+cargo run --bin spike-boost -- --loopback=10   # process loopback; captures, disturbs nothing
+cargo run --bin spike-boost -- --endpoint-loopback=10  # classic loopback, whole mix
+cargo run --bin spike-boost -- --mute-probe=6  # INTRUSIVE: silences the phone. Never yet run.
 cargo run --bin spike-a2dp                     # read-only: enumerate + construct
 cargo run --bin spike-a2dp -- --start-only     # exercises the radio, moves no audio
 cargo run --bin spike-a2dp -- --open --hold=N  # OPENS A STREAM — routes phone audio

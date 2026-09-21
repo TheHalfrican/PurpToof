@@ -34,6 +34,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-appender = "0.2"
 tray-icon = "0.25.0"
+# A direct dependency purely so the `#[implement]` macro resolves. It expands
+# to absolute `::windows_core` paths, which do not resolve through the
+# `windows` facade re-export, and implementing a COM interface is unavoidable
+# for `ActivateAudioInterfaceAsync` - its result arrives on a callback.
+# Pinned to the version `windows` itself depends on so there is only ever one.
+windows-core = "0.62.2"
 
 [dev-dependencies]
 # Two invariants that table-driven tests cannot express: that no input
@@ -78,6 +84,11 @@ features = [
     "Win32_UI_Shell",
     # PKEY_Device_FriendlyName.
     "Win32_Devices_FunctionDiscovery",
+    # SECURITY_ATTRIBUTES, which CreateEventW takes as its first parameter.
+    # The event is how a WASAPI capture client is told a packet has arrived;
+    # polling a loopback stream instead would make the spike's packet-arrival
+    # measurement a measurement of our own poll interval. See bin/spike-boost.
+    "Win32_Security",
     # OpenProcess / QueryFullProcessImageNameW — naming the process that owns
     # an audio session, which is the whole point of the attribution check.
     "Win32_System_Threading",
